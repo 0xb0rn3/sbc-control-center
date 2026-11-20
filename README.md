@@ -129,4 +129,4 @@ Browser screenshots are in `docs/screenshots/`. CI runs the Python test suite, P
 
 ## License
 
-No license has been selected for this initial public snapshot. Public visibility on GitHub does not by itself grant permission to redistribute or publish modified copies. A license will be added when the project owner chooses one.
+MIT
