@@ -4,7 +4,7 @@ from __future__ import annotations
 import collections,datetime as dt,ipaddress,os,re,socket,struct,subprocess,threading,time
 from pathlib import Path
 from typing import Any
-import device_intelligence,wireless_adapter,dns_bypass_sensor
+import device_intelligence,wireless_adapter,dns_bypass_sensor,flow_telemetry
 ETH_P_ALL=0x0003;ETH_P_ARP=0x0806;PACKET_OUTGOING=getattr(socket,'PACKET_OUTGOING',4)
 SOL_PACKET=263;PACKET_STATISTICS=6
 MAX_EVENTS=2500;MAX_FLOWS=2048;MAX_CAPTURE_SECONDS=600;MAX_PCAP_BYTES=32*1024*1024
@@ -145,7 +145,7 @@ class PcapngWriter:
  def size(self):return self.written
 class PacketMonitor:
  def __init__(self,ring_size=MAX_EVENTS,conntrack_path=CONNTRACK_FILE,lease_path=LEASE_FILE):
-  self.lock=threading.RLock();self.events=collections.deque(maxlen=ring_size);self.flows=collections.OrderedDict();self.lease_path=lease_path;self.conntrack_path=conntrack_path
+  self.lock=threading.RLock();self.events=collections.deque(maxlen=ring_size);self.flow_tracker=flow_telemetry.FlowRateTracker();self.flow_event_emit=collections.OrderedDict();self.lease_path=lease_path;self.conntrack_path=conntrack_path
   self.stop_event=threading.Event();self.threads=[];self.sockets=[];self.writer=None;self.active=False;self.started=None;self.stop_at=None;self.duration=0
   self.interfaces=[];self.allowed={};self.subnets=();self.scope={};self.local_dns=set();self.upstreams=set();self.counts={};self.errors=[];self.overwritten=0;self.next_id=0;self.last_packet_at=None;self.last_pcap=None;self.last_pcap_bytes=0
   self.leases={};self.identities={}
@@ -181,13 +181,20 @@ class PacketMonitor:
      sec,nsec=struct.unpack('=qq',cmsg[:16]);epoch=sec*1_000_000_000+nsec;break
    ptype=addr[2] if len(addr)>2 and isinstance(addr[2],int) else 0;link=addr[1] if len(addr)>1 and isinstance(addr[1],int) else None
    e=self._event(iface,ptype,link,data,epoch);self.last_packet_at=epoch/1e9
-   key=e.get('flow_id') or '|'.join(str(e.get(k)) for k in ('client_ip','remote_ip','protocol','destination_port'))
-   f=self.flows.get(key)
-   if not f:f={'first_timestamp_ns':epoch,'packets':0,'bytes':0,'client_ip':e.get('client_ip'),'remote_ip':e.get('remote_ip'),'protocol':e.get('protocol'),'interface':iface};self.flows[key]=f
-   f['last_timestamp_ns']=epoch;f['packets']+=1;f['bytes']+=len(data);f['bytes_per_second']=f['bytes']/max(.001,(epoch-f['first_timestamp_ns'])/1e9);self.flows.move_to_end(key)
-   while len(self.flows)>MAX_FLOWS:self.flows.popitem(last=False)
-   if e.get('application') in ('DNS','DHCP','ARP','mDNS','SSDP / UPnP') or time.time()-f.get('_last_emit',0)>=1:
-    self.next_id+=1;e['id']=self.next_id;self.events.append(e);f['_last_emit']=time.time()
+   client_ip=e.get('client_ip');source_ip=e.get('source_ip');destination_ip=e.get('destination_ip')
+   if client_ip and source_ip==client_ip:
+    direction='upload';client_port=e.get('source_port');remote_port=e.get('destination_port')
+   elif client_ip and destination_ip==client_ip:
+    direction='download';client_port=e.get('destination_port');remote_port=e.get('source_port')
+   else:
+    direction='unknown';client_port=e.get('source_port');remote_port=e.get('destination_port')
+   flow_client=client_ip or source_ip;flow_remote=e.get('remote_ip') or destination_ip
+   flow_id=self.flow_tracker.record(packet_bytes=len(data),packet_timestamp_ns=epoch,direction=direction,metadata={'interface':iface,'client_ip':flow_client,'remote_ip':flow_remote,'client_port':client_port,'remote_port':remote_port,'protocol':e.get('protocol'),'application':e.get('application')})
+   e['flow_id']=flow_id
+   now_mono=time.monotonic();last_emit=self.flow_event_emit.get(flow_id,0.0)
+   if e.get('application') in ('DNS','DHCP','ARP','mDNS','SSDP / UPnP') or now_mono-last_emit>=1.0:
+    self.next_id+=1;e['id']=self.next_id;self.events.append(e);self.flow_event_emit[flow_id]=now_mono;self.flow_event_emit.move_to_end(flow_id)
+    while len(self.flow_event_emit)>MAX_FLOWS:self.flow_event_emit.popitem(last=False)
     if len(self.events)==self.events.maxlen:self.overwritten+=1
    c=self.counts[iface];c['packets']+=1;c['bytes']+=len(data)
    if self.writer:self.writer.write_packet(iface,data,epoch)
@@ -214,14 +221,23 @@ class PacketMonitor:
   except OSError as e:
    for _,x in opened:x.close()
    raise RuntimeError(f'Could not start packet capture: {e}')
-  self.events.clear();self.flows.clear();self.next_id=0;self.overwritten=0;self.errors=[];self.counts={i:{'packets':0,'bytes':0,'kernel_packets':0,'socket_drops':0,'socket_rcvbuf_bytes':s.getsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF)} for i,s in opened}
+  self.events.clear();self.flow_tracker.reset();self.flow_event_emit.clear();self.next_id=0;self.overwritten=0;self.errors=[];self.counts={i:{'packets':0,'bytes':0,'kernel_packets':0,'socket_drops':0,'socket_rcvbuf_bytes':s.getsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF)} for i,s in opened}
   self.interfaces=list(interfaces);self.allowed=dict(allowed_interfaces);self.subnets=tuple(subnets);self.scope=dict(scope_networks or {});self.local_dns=set(ap_dns_addresses or ());self.upstreams=set(configured_upstreams or ())
   self.started=time.time();self.duration=duration_seconds;self.stop_at=self.started+duration_seconds;self.last_packet_at=None;self.active=True;self.stop_event=threading.Event();self.sockets=[x for _,x in opened];self._refresh_maps()
   self.threads=[]
   for iface,sock in opened:
    t=threading.Thread(target=self._worker,args=(iface,sock),daemon=True,name='packet-'+iface);t.start();self.threads.append(t)
+  sampler=threading.Thread(target=self._flow_sampler_worker,daemon=True,name='flow-rate-sampler');sampler.start();self.threads.append(sampler)
   timer=threading.Thread(target=self._expiry,daemon=True);timer.start();self.threads.append(timer)
   return self.snapshot(0,0)
+ def _flow_sampler_worker(self):
+  deadline=time.monotonic()+1.0
+  while not self.stop_event.is_set():
+   if self.stop_event.wait(max(0.0,deadline-time.monotonic())):break
+   try:self.flow_tracker.sample_once()
+   except Exception as ex:self.errors.append(f'flow sampler: {ex}'[:180])
+   now=time.monotonic();deadline+=1.0
+   if now>deadline:deadline=now+1.0
  def _expiry(self):
   while not self.stop_event.wait(.5):
    if time.time()>=self.stop_at:self.stop();return
@@ -237,13 +253,17 @@ class PacketMonitor:
   for t in self.threads:
    if t is not threading.current_thread() and t.is_alive():t.join(.3)
   self.sockets=[];self.threads=[]
+  if was:
+   try:self.flow_tracker.sample_once()
+   except Exception as ex:self.errors.append(f'final flow sample: {ex}'[:180])
   if self.writer:self.writer.close();self.last_pcap=self.writer.path.name;self.last_pcap_bytes=self.writer.size;self.writer=None
   return {'ok':True,'stopped':was,'capture':self.snapshot(0,0)['capture']}
  def snapshot(self,after=0,limit=200):
   if isinstance(after,bool) or not isinstance(after,int) or after<0:after=0
   if isinstance(limit,bool) or not isinstance(limit,int) or not 0<=limit<=250:limit=200
   events=[dict(x) for x in self.events if x['id']>after][:limit] if limit else []
-  flows=[{k:v for k,v in x.items() if not k.startswith('_')} for x in list(self.flows.values())[-100:][::-1]]
-  capture={'active':self.active,'started_at':self.started,'stop_at':self.stop_at,'duration_seconds':self.duration,'interfaces':self.interfaces,'counts':{k:dict(v) for k,v in self.counts.items()},'errors':self.errors[-8:],'ring_capacity':self.events.maxlen,'ring_size':len(self.events),'overwritten_events':self.overwritten,'last_packet_at':self.last_packet_at,'last_event_id':self.next_id,'flow_count':len(self.flows),'flows':flows,'mode':'bounded metadata + optional PCAPNG','payload_retained_in_memory':False,'pcapng_enabled':bool(self.writer),'pcapng_path':str(self.writer.path) if self.writer else str(CAPTURE_DIR/self.last_pcap) if self.last_pcap else None,'pcapng_bytes':self.writer.size if self.writer else self.last_pcap_bytes,'pcapng_limit_reached':bool(self.writer and self.writer.full),'conntrack_available':self.conntrack_path.exists()}
+  flows=self.flow_tracker.summary(100);flow_status=self.flow_tracker.status()
+  capture={'active':self.active,'started_at':self.started,'stop_at':self.stop_at,'duration_seconds':self.duration,'interfaces':self.interfaces,'counts':{k:dict(v) for k,v in self.counts.items()},'errors':self.errors[-8:],'ring_capacity':self.events.maxlen,'ring_size':len(self.events),'overwritten_events':self.overwritten,'last_packet_at':self.last_packet_at,'last_event_id':self.next_id,'flow_count':flow_status['active_flows'],'flows':flows,'flow_sampling':flow_status,'mode':'bounded metadata + optional PCAPNG','payload_retained_in_memory':False,'pcapng_enabled':bool(self.writer),'pcapng_path':str(self.writer.path) if self.writer else str(CAPTURE_DIR/self.last_pcap) if self.last_pcap else None,'pcapng_bytes':self.writer.size if self.writer else self.last_pcap_bytes,'pcapng_limit_reached':bool(self.writer and self.writer.full),'conntrack_available':self.conntrack_path.exists()}
   return {'ok':True,'capture':capture,'events':events,'flows':flows}
+ def flow_series(self,flow_id,limit=60):return self.flow_tracker.series(flow_id,limit)
 def adapter_inventory(interfaces=None):return wireless_adapter.status(tuple((interfaces or {}).keys())).get('adapters',[])
