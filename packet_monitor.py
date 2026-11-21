@@ -135,7 +135,7 @@ class PcapngWriter:
   if not data or data[0]>>4 not in (4,6):return False
   with self.lock:
    if self.full or self.f.closed or iface not in self.index:return False
-   n=min(len(data),65535);body=struct.pack('<IIIII',self.index[iface],epoch_ns>>32,(epoch_ns&0xffffffff)//1000,n,n)+data[:n]+b'\0'*((-n)%4)
+   n=min(len(data),65535);micros=epoch_ns//1000;body=struct.pack('<IIIII',self.index[iface],micros>>32,micros&0xffffffff,n,n)+data[:n]+b'\0'*((-n)%4)
    if self.written+12+len(body)>self.max:self.full=True;return False
    self._block(6,body);return True
  def close(self):
@@ -242,4 +242,4 @@ class PacketMonitor:
   flows=[{k:v for k,v in x.items() if not k.startswith('_')} for x in list(self.flows.values())[-100:][::-1]]
   capture={'active':self.active,'started_at':self.started,'stop_at':self.stop_at,'duration_seconds':self.duration,'interfaces':self.interfaces,'counts':{k:dict(v) for k,v in self.counts.items()},'errors':self.errors[-8:],'ring_capacity':self.events.maxlen,'ring_size':len(self.events),'overwritten_events':self.overwritten,'last_packet_at':self.last_packet_at,'last_event_id':self.next_id,'flow_count':len(self.flows),'flows':flows,'mode':'bounded metadata + optional PCAPNG','payload_retained_in_memory':False,'pcapng_enabled':bool(self.writer),'pcapng_path':str(self.writer.path) if self.writer else str(CAPTURE_DIR/self.last_pcap) if self.last_pcap else None,'pcapng_bytes':self.writer.size if self.writer else self.last_pcap_bytes,'pcapng_limit_reached':bool(self.writer and self.writer.full),'conntrack_available':self.conntrack_path.exists()}
   return {'ok':True,'capture':capture,'events':events,'flows':flows}
-def adapter_inventory(interfaces=None):return wireless_adapter.status(tuple((interfaces or {}).keys()))
+def adapter_inventory(interfaces=None):return wireless_adapter.status(tuple((interfaces or {}).keys())).get('adapters',[])
