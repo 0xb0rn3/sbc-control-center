@@ -104,7 +104,7 @@ class NavigationMarkupTests(unittest.TestCase):
             self.assertIn(f'id="{element_id}"', self.source)
         self.assertIn('function scheduleTelemetryPoll()', self.source)
         self.assertIn('setTimeout(async()=>{await refreshTelemetry();scheduleTelemetryPoll();},1000)', self.source)
-        self.assertIn('if(telemetryHistory.length>60)telemetryHistory.shift()', self.source)
+        self.assertIn('if(telemetryHistory.length>900)telemetryHistory=telemetryHistory.slice(-900)', self.source)
         self.assertNotIn('setInterval(refreshTelemetry,1500)', self.source)
         self.assertIn('packets per second', self.source.lower())
         self.assertIn('does not capture packet payloads', self.source)
