@@ -47,8 +47,20 @@ def read_network_counters(sys_class_net: Path = Path('/sys/class/net')) -> dict[
         except OSError:
             state = 'unknown'
         virtual = name == 'lo' or name.startswith(EXCLUDED_PREFIXES[1:])
+        try:
+            ifindex = int((iface / 'ifindex').read_text(encoding='ascii').strip())
+            iflink = int((iface / 'iflink').read_text(encoding='ascii').strip())
+        except (OSError, ValueError):
+            ifindex = iflink = -1
+        has_device = (iface / 'device').exists()
+        has_master = (iface / 'master').exists()
+        # A physical total excludes loopback, virtual devices, stacked VLANs,
+        # bridges/bonds, tunnel links and lower devices enslaved to a master.
+        physical = bool(has_device and ifindex > 0 and iflink == ifindex and not has_master and not virtual)
         result[name] = {
-            **values, 'state': state, 'included_in_physical_total': not virtual,
+            **values, 'state': state, 'ifindex': ifindex, 'iflink': iflink,
+            'has_device': has_device, 'has_master': has_master,
+            'included_in_physical_total': physical,
             'source': 'linux-sysfs-interface-statistics',
         }
     return result
