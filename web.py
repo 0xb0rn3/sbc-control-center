@@ -797,6 +797,22 @@ class Handler(BaseHTTPRequestHandler):
             result = agent_request({'action': 'network_inventory'}, timeout=20)
             self.send_json(200 if result.get('ok') else 503, result)
             return
+        if path == '/api/packet-flow-series':
+            auth = self.require_session()
+            if not auth:
+                return
+            query = urllib.parse.parse_qs(parsed.query, keep_blank_values=False)
+            flow_id = query.get('flow_id', [''])[0]
+            try:
+                limit = int(query.get('limit', ['60'])[0])
+                if not re.fullmatch(r'[0-9a-f]{24}', flow_id) or not 1 <= limit <= 60:
+                    raise ValueError
+            except (TypeError, ValueError):
+                self.send_json(400, {'ok': False, 'error': 'Invalid flow identifier or history limit.'})
+                return
+            result = agent_request({'action': 'packet_flow_series', 'flow_id': flow_id, 'limit': limit}, timeout=5)
+            self.send_json(200 if result.get('ok') else 404, result)
+            return
         if path == '/api/packet-capture':
             auth = self.require_session()
             if not auth:
