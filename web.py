@@ -26,6 +26,12 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from security_operations import snapshot_from_capture, evidence_for_event
+except ImportError:
+    snapshot_from_capture = None  # type: ignore[assignment]
+    evidence_for_event = None  # type: ignore[assignment]
+
+try:
     from fido2.server import Fido2Server
     from fido2.webauthn import AttestedCredentialData, AuthenticatorData
     try:
@@ -796,6 +802,40 @@ class Handler(BaseHTTPRequestHandler):
                 return
             result = agent_request({'action': 'network_inventory'}, timeout=20)
             self.send_json(200 if result.get('ok') else 503, result)
+            return
+        if path == '/api/security-operations':
+            auth = self.require_session()
+            if not auth:
+                return
+            if snapshot_from_capture is None:
+                self.send_json(503, {'ok': False, 'error': 'Security operations module is unavailable.'})
+                return
+            capture = agent_request({'action': 'packet_capture_snapshot', 'after': 0, 'limit': 250}, timeout=6)
+            if not capture.get('ok'):
+                self.send_json(503, capture)
+                return
+            self.send_json(200, snapshot_from_capture(capture))
+            return
+        if path == '/api/security-event':
+            auth = self.require_session()
+            if not auth:
+                return
+            event_id = urllib.parse.parse_qs(parsed.query, keep_blank_values=False).get('id', [''])[0]
+            if not re.fullmatch(r'ev_[a-f0-9]{24}', event_id):
+                self.send_json(400, {'ok': False, 'error': 'Invalid packet evidence identifier.'})
+                return
+            if evidence_for_event is None:
+                self.send_json(503, {'ok': False, 'error': 'Packet evidence module is unavailable.'})
+                return
+            capture = agent_request({'action': 'packet_capture_snapshot', 'after': 0, 'limit': 250}, timeout=6)
+            if not capture.get('ok'):
+                self.send_json(503, capture)
+                return
+            evidence = evidence_for_event(event_id, capture)
+            if evidence is None:
+                self.send_json(404, {'ok': False, 'error': 'Packet event is no longer retained in the bounded capture ring.'})
+                return
+            self.send_json(200, evidence)
             return
         if path == '/api/packet-flow-series':
             auth = self.require_session()
