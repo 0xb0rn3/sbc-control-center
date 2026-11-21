@@ -202,6 +202,7 @@ class FlowRateTracker:
                     "sequence": self._sequence,
                     "timestamp": _utc_iso(epoch_now),
                     "timestamp_unix_ns": epoch_now,
+                    "timestamp_unix_ns_text": str(epoch_now),
                     "monotonic_ns": mono_now,
                     "interval_seconds": elapsed,
                     **deltas,
