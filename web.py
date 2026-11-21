@@ -1210,6 +1210,8 @@ class Handler(BaseHTTPRequestHandler):
                 payload = {'action': 'portal_update_check'}
             elif action == 'network_scan':
                 payload = {'action': 'network_scan', 'interfaces': data.get('interfaces')}
+            elif action == 'network_fingerprint':
+                payload = {'action': 'network_fingerprint', 'address': data.get('address')}
             elif action == 'packet_capture_start':
                 payload = {'action': 'packet_capture_start', 'duration_seconds': data.get('duration_seconds'),
                            'interfaces': data.get('interfaces'), 'save_pcap': data.get('save_pcap', False)}
