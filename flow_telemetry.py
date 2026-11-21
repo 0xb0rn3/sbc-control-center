@@ -152,6 +152,7 @@ class FlowRateTracker:
                 self._series.move_to_end(flow_id)
             while len(self._flows) > self.max_flows:
                 evicted_id, _ = self._flows.popitem(last=False)
+                self._flow_evictions += 1
                 if evicted_id in self._series:
                     del self._series[evicted_id]
                     self._series_evictions += 1
