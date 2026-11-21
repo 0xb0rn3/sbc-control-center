@@ -30,3 +30,17 @@ The project includes source-level checks and automated tests for HTTPS-only star
 - Trust the local HTTPS certificate (or install a certificate from your own local CA) and use a stable DNS name for WebAuthn passkeys. Do not proxy the application over plaintext HTTP.
 - Keep backups encrypted and access-controlled.
 - Review changes to `install.sh`, `upgrade.sh`, `agent.py`, `web.py` and `pam_auth.py` before deployment.
+
+
+## Network telemetry and packet capture
+
+Network observability is sensitive administrative data. Keep the HTTPS portal on trusted management networks and do not expose it directly to the public internet.
+
+- Passive telemetry reads kernel counters and local network metadata. It is collected by the privileged agent and stored in a bounded in-memory ring; browser requests only read samples and cannot reset the sampling clock.
+- Device inventory can contain private IP addresses, MAC addresses, DHCP hostnames, SSIDs, DNS names and inferred device categories. These records must not be uploaded to public issue trackers or included in diagnostic bundles without explicit review.
+- Active ARP discovery, Nmap fingerprinting, packet capture and local device-label changes require fresh sudo-password verification and are scoped to configured AP interfaces/networks.
+- Packet capture defaults to metadata-only mode. Full PCAPNG requires a separate explicit option, is restricted to root-owned mode-0600 files, and is bounded to 300 seconds and 32 MiB. Captures can contain sensitive traffic metadata and must be deleted when no longer required.
+- The standard event API never returns packet payloads. TShark analysis is limited to completed private capture files, a fixed field list, 5,000 packets, 15 seconds and bounded output.
+- DNS endpoint matches and direct-DNS packets are indicators, not proof of successful bypass. Enforcement outcomes remain unknown unless independently verified by firewall counters/traces or resolver logs.
+- AdGuard credentials, if configured, belong in a root-owned mode-0600 `/etc/sbc-control-center/dns.json` file and must never be committed. The optional integration only reads local AdGuard status/query logs in this release.
+- The agent systemd unit allows AF_PACKET and CAP_NET_RAW only for the privileged agent. Do not grant packet-capture capabilities to the unprivileged web process.
