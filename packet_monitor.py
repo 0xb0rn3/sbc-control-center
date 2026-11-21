@@ -227,11 +227,15 @@ class PacketMonitor:
    if time.time()>=self.stop_at:self.stop();return
  def stop(self):
   was=self.active;self.active=False;self.stop_event.set()
-  for s in self.sockets:
-   try:s.close()
+  # Let recvmsg time out naturally so PACKET_STATISTICS can be read before
+  # the socket is closed. Then force-close only any worker that did not exit.
+  for t in self.threads:
+   if t is not threading.current_thread():t.join(.6)
+  for sock in self.sockets:
+   try:sock.close()
    except OSError:pass
   for t in self.threads:
-   if t is not threading.current_thread():t.join(.5)
+   if t is not threading.current_thread() and t.is_alive():t.join(.3)
   self.sockets=[];self.threads=[]
   if self.writer:self.writer.close();self.last_pcap=self.writer.path.name;self.last_pcap_bytes=self.writer.size;self.writer=None
   return {'ok':True,'stopped':was,'capture':self.snapshot(0,0)['capture']}
