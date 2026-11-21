@@ -115,7 +115,7 @@ class FlowRateTrackerTests(unittest.TestCase):
         self.clock.advance(1.25)
         self.tracker.sample_once()
         flow_id = flow_telemetry.FlowRateTracker.make_flow_id(self.metadata)
-        result = self.tracker.series(flow_id)
+        result = self.tracker.series(flow_id, limit=3)
         sample = result["samples"][-1]
         self.assertAlmostEqual(sample["interval_seconds"], 1.25)
         self.assertAlmostEqual(sample["upload_bytes_per_second"], 800.0)
@@ -130,7 +130,7 @@ class FlowRateTrackerTests(unittest.TestCase):
         self.record(500, "download")
         self.clock.advance(0.5)
         self.tracker.sample_once()
-        sample = self.tracker.series(flow_id)["samples"][-1]
+        sample = self.tracker.series(flow_id, limit=3)["samples"][-1]
         self.assertAlmostEqual(sample["bytes_per_second"], 1000.0)
         self.assertEqual(sample["upload_bytes_per_second"], 0.0)
         self.assertAlmostEqual(sample["download_bytes_per_second"], 1000.0)
