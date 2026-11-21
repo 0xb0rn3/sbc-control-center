@@ -315,6 +315,9 @@ pre { max-height: 430px; margin: 0; padding: 12px; overflow: auto; border: 1px s
 .telemetry-swatch { width:16px; height:2px; background:var(--accent); display:inline-block; }
 .telemetry-swatch.alt { background:var(--accent-hover); }
 .telemetry-status { color:var(--dim); font-size:10px; font-variant-numeric:tabular-nums; }
+.flow-select { width:min(100%,360px); }
+#obsFlowChart { cursor:crosshair; }
+#obsFlowTooltip { margin-top:6px; min-height:16px; font-variant-numeric:tabular-nums; }
 .thermal-sensors { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:0 18px; }
 .cpu-core-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(130px,1fr)); gap:10px 14px; }
 .cpu-core-item { display:grid; gap:5px; min-width:0; }
@@ -461,7 +464,7 @@ pre { max-height: 430px; margin: 0; padding: 12px; overflow: auto; border: 1px s
 <div class="fieldgrid"><div class="field"><label for="obsCaptureInterfaces">Configured capture interfaces</label><select id="obsCaptureInterfaces" class="select" multiple size="4"></select><span class="field-help">Only configured interfaces are selectable.</span></div><div class="field"><label for="obsCaptureDuration">Capture duration</label><select id="obsCaptureDuration" class="select"><option value="30">30 seconds</option><option value="60">60 seconds</option><option value="120">2 minutes</option><option value="300">5 minutes</option><option value="600">10 minutes</option></select><label class="checkline"><input type="checkbox" id="obsSavePcap"> Save full PCAPNG (privileged, sensitive)</label><span class="field-help">PCAPNG is capped at 300 seconds and 32 MiB.</span></div></div>
 <div class="btnrow"><button class="btn primary" id="obsCaptureStart">Start capture</button><button class="btn danger" id="obsCaptureStop" disabled>Stop capture</button><button class="btn" id="obsCaptureRefresh">Refresh events</button><button class="btn" id="obsAnalyseCapture" disabled>Analyse saved capture with TShark</button></div>
 <div class="kv"><span>Capture status</span><strong id="obsCaptureStatus">Not running</strong></div><div class="kv"><span>Packets / bytes</span><strong id="obsCaptureCounts">—</strong></div><div class="kv"><span>Socket drops / ring overwrites</span><strong id="obsCaptureDrops">—</strong></div>
-<div class="tablewrap"><table class="compact"><thead><tr><th>Captured at</th><th>Client</th><th>Protocol</th><th>Endpoints</th><th>DNS / SNI / domain</th><th>Bytes</th></tr></thead><tbody id="obsPacketEvents"><tr><td colspan="6" class="empty">Start capture to inspect packet metadata.</td></tr></tbody></table></div><div class="cardhead" style="margin-top:12px"><div><h3>Live flows</h3><p class="sub">Flow byte rate is an average over the observed flow lifetime; first/last packet timestamps are retained separately.</p></div></div><div class="tablewrap"><table class="compact"><thead><tr><th>First packet</th><th>Last packet</th><th>Client → remote</th><th>Protocol</th><th>Packets / bytes</th><th>Average B/s</th></tr></thead><tbody id="obsPacketFlows"><tr><td colspan="6" class="empty">No active flows.</td></tr></tbody></table></div></div>
+<div class="tablewrap"><table class="compact"><thead><tr><th>Captured at</th><th>Client</th><th>Protocol</th><th>Endpoints</th><th>DNS / SNI / domain</th><th>Bytes</th></tr></thead><tbody id="obsPacketEvents"><tr><td colspan="6" class="empty">Start capture to inspect packet metadata.</td></tr></tbody></table></div><div class="cardhead" style="margin-top:12px"><div><h3>Live flows</h3><p class="sub">Current rates come from the server-side per-flow sampler using measured monotonic intervals. Lifetime averages are shown separately.</p></div></div><div class="tablewrap"><table class="compact"><thead><tr><th>First packet</th><th>Last packet</th><th>Client → remote</th><th>Protocol</th><th>Packets / bytes</th><th>Current B/s</th></tr></thead><tbody id="obsPacketFlows"><tr><td colspan="6" class="empty">No active flows.</td></tr></tbody></table></div><div class="card" style="margin-top:12px"><div class="cardhead"><div><h3>Per-flow throughput history</h3><p class="sub">Upload and download byte rates from AF_PACKET packet lengths. X-axis uses actual backend sample timestamps, not browser polling intervals.</p></div><select id="obsFlowSelect" aria-label="Select flow for throughput graph"></select></div><canvas id="obsFlowChart" class="telemetry-chart" role="img" aria-label="Selected flow upload and download bytes per second over measured time"></canvas><div class="telemetry-chart-meta"><span id="obsFlowChartStatus">Waiting for a sampled flow…</span><span id="obsFlowChartLatest">No samples yet</span></div><div class="telemetry-status" id="obsFlowTooltip" aria-live="polite"></div></div></div>
 <div class="grid two" style="margin-top:12px"><div class="card"><div class="cardhead"><div><h3>DNS bypass indicators</h3><p class="sub">Attempts and endpoint indicators, not proof of bypass.</p></div></div><div id="obsDnsIndicators" class="empty">No indicators in current capture.</div></div><div class="card"><div class="cardhead"><div><h3>AdGuard query log</h3><p class="sub">Optional local resolver correlation.</p></div><button class="btn" id="obsDnsRefresh">Refresh</button></div><div class="tablewrap"><table class="compact"><thead><tr><th>Time</th><th>Client</th><th>Domain</th><th>Reason / status</th></tr></thead><tbody id="obsDnsQueries"><tr><td colspan="4" class="empty">AdGuard Home is optional.</td></tr></tbody></table></div></div></div>
 </section>
 
@@ -1051,13 +1054,96 @@ async function refreshNetworkObservability(showErrors=true){
  $('networkObsUpdated').textContent='Inventory sampled '+new Date(Number(n.timestamp)*1000).toLocaleString();await refreshPacketCapture(false);
  }catch(e){if(showErrors)showToast(e.message,true);$('networkObsUpdated').textContent='Inventory unavailable';}
 }
+let selectedFlowId = '';
+let flowSeriesSamples = [];
+let flowChartPoints = [];
+
+function drawFlowSeriesChart(){
+ const canvas=$('obsFlowChart');if(!canvas)return;
+ const width=Math.max(320,canvas.clientWidth||640),height=Math.max(120,canvas.clientHeight||150),dpr=window.devicePixelRatio||1;
+ canvas.width=Math.floor(width*dpr);canvas.height=Math.floor(height*dpr);
+ const ctx=canvas.getContext('2d');if(!ctx)return;ctx.scale(dpr,dpr);ctx.clearRect(0,0,width,height);
+ const styles=getComputedStyle(document.documentElement);
+ const muted=styles.getPropertyValue('--muted').trim()||'#999';
+ const grid=styles.getPropertyValue('--line').trim()||'#444';
+ const uploadColor=styles.getPropertyValue('--accent').trim()||'#8b9dff';
+ const downloadColor=styles.getPropertyValue('--accent-hover').trim()||'#c5a0ff';
+ const rows=flowSeriesSamples.filter(x=>x&&x.sample_valid&&Number.isFinite(Date.parse(x.timestamp))&&Number.isFinite(Number(x.upload_bytes_per_second))&&Number.isFinite(Number(x.download_bytes_per_second)));
+ if(!rows.length){
+  ctx.fillStyle=muted;ctx.font='11px sans-serif';ctx.fillText('Waiting for the first valid per-flow interval sample…',14,Math.round(height/2));
+  $('obsFlowChartStatus').textContent='No measured interval samples available yet';$('obsFlowChartLatest').textContent='';$('obsFlowTooltip').textContent='';flowChartPoints=[];return;
+ }
+ const times=rows.map(x=>Date.parse(x.timestamp));let minTime=Math.min(...times),maxTime=Math.max(...times);
+ if(maxTime<=minTime)maxTime=minTime+1000;
+ const maxRate=Math.max(1,...rows.map(x=>Math.max(Number(x.upload_bytes_per_second)||0,Number(x.download_bytes_per_second)||0)))*1.12;
+ const left=58,right=12,top=10,bottom=28,plotW=width-left-right,plotH=height-top-bottom;
+ const xAt=t=>left+((t-minTime)/(maxTime-minTime))*plotW;
+ const yAt=v=>top+plotH-(Math.max(0,v)/maxRate)*plotH;
+ ctx.font='9px sans-serif';ctx.lineWidth=1;ctx.strokeStyle=grid;ctx.fillStyle=muted;
+ for(let i=0;i<=4;i++){
+  const value=maxRate*i/4,y=yAt(value);ctx.beginPath();ctx.moveTo(left,y);ctx.lineTo(width-right,y);ctx.stroke();
+  ctx.textAlign='right';ctx.fillText(fmtRate(value),left-7,y+3);
+ }
+ for(let i=0;i<=3;i++){
+  const t=minTime+(maxTime-minTime)*i/3,x=left+plotW*i/3;
+  ctx.beginPath();ctx.moveTo(x,top);ctx.lineTo(x,top+plotH);ctx.stroke();
+  ctx.textAlign='center';ctx.fillText(new Date(t).toLocaleTimeString(),x,height-8);
+ }
+ function drawLine(key,color){
+  ctx.beginPath();ctx.strokeStyle=color;ctx.lineWidth=1.8;let started=false;
+  for(const row of rows){const x=xAt(Date.parse(row.timestamp)),y=yAt(Number(row[key])||0);if(!started){ctx.moveTo(x,y);started=true;}else ctx.lineTo(x,y);}
+  if(started)ctx.stroke();
+ }
+ drawLine('upload_bytes_per_second',uploadColor);drawLine('download_bytes_per_second',downloadColor);
+ flowChartPoints=rows.map(row=>({x:xAt(Date.parse(row.timestamp)),sample:row}));
+ $('obsFlowChartStatus').textContent=rows.length+' measured samples · '+rows[rows.length-1].interval_seconds.toFixed(3)+' s latest interval · target 1 s';
+ const latest=rows[rows.length-1];$('obsFlowChartLatest').textContent='Latest: '+new Date(Date.parse(latest.timestamp)).toLocaleString();
+ $('obsFlowTooltip').textContent='';
+ canvas.setAttribute('aria-label','Flow throughput graph with '+rows.length+' timestamped samples. Latest sample '+latest.timestamp);
+}
+
+function bindFlowChartTooltip(){
+ const canvas=$('obsFlowChart');if(!canvas||canvas.dataset.tooltipBound)return;
+ canvas.dataset.tooltipBound='1';
+ canvas.addEventListener('pointermove',event=>{
+  if(!flowChartPoints.length)return;
+  const rect=canvas.getBoundingClientRect(),x=event.clientX-rect.left;
+  let nearest=flowChartPoints[0];
+  for(const point of flowChartPoints)if(Math.abs(point.x-x)<Math.abs(nearest.x-x))nearest=point;
+  const sample=nearest.sample;
+  $('obsFlowTooltip').textContent=sample.timestamp+' local '+new Date(Date.parse(sample.timestamp)).toLocaleString()+
+   ' · interval '+Number(sample.interval_seconds).toFixed(6)+' s · upload '+fmtRate(Number(sample.upload_bytes_per_second)||0)+
+   ' · download '+fmtRate(Number(sample.download_bytes_per_second)||0)+' · total '+fmtRate(Number(sample.bytes_per_second)||0);
+ });
+ canvas.addEventListener('pointerleave',()=>{$('obsFlowTooltip').textContent='';});
+}
+
+async function refreshFlowSeries(flowId){
+ selectedFlowId=flowId||'';
+ if(!selectedFlowId){flowSeriesSamples=[];drawFlowSeriesChart();return;}
+ try{
+  const result=await api('/api/packet-flow-series?flow_id='+encodeURIComponent(selectedFlowId)+'&limit=60');
+  flowSeriesSamples=result.samples||[];drawFlowSeriesChart();
+ }catch(error){
+  flowSeriesSamples=[];drawFlowSeriesChart();$('obsFlowChartStatus').textContent=error.message||'Flow history unavailable';
+ }
+}
+
 async function refreshPacketCapture(showErrors=true){
  try{const r=await api('/api/packet-capture?after='+packetEventCursor+'&limit=200'),c=r.capture||{},events=r.events||[];if(events.length)packetEventCursor=Math.max(packetEventCursor,...events.map(e=>Number(e.id)||0));
  $('obsCaptureState').textContent=c.active?'Running':'Stopped';$('obsCaptureNote').textContent=c.active?'Capturing '+(c.interfaces||[]).join(', '):'Metadata only until explicitly started';$('obsCaptureStatus').textContent=c.active?'Running · until '+new Date(Number(c.stop_at)*1000).toLocaleTimeString():'Not running';
  const counts=Object.values(c.counts||{});$('obsCaptureCounts').textContent=counts.reduce((a,x)=>a+(x.packets||0),0)+' packets · '+fmtBytes(counts.reduce((a,x)=>a+(x.bytes||0),0));$('obsCaptureDrops').textContent=counts.reduce((a,x)=>a+(x.socket_drops||0),0)+' socket drops · '+(c.overwritten_events||0)+' ring overwrites';
  $('obsCaptureStart').disabled=!!c.active;$('obsCaptureStop').disabled=!c.active;$('obsPacketMode').textContent=c.pcapng_enabled?'Metadata + PCAPNG':'Metadata only';$('obsAnalyseCapture').disabled=!c.pcapng_name;if(c.pcapng_name)$('obsAnalyseCapture').dataset.name=c.pcapng_name;
  $('obsPacketEvents').innerHTML=events.map(e=>'<tr><td>'+esc(new Date(Number(e.timestamp)*1000).toLocaleTimeString())+'</td><td>'+esc(e.client_label||e.client_name||e.client_ip||'Unattributed')+'</td><td>'+esc(e.protocol||'')+' / '+esc(e.application||'')+'</td><td class="mono">'+esc((e.source_ip||'')+':'+(e.source_port||''))+' → '+esc((e.destination_ip||'')+':'+(e.destination_port||''))+'</td><td>'+esc(e.dns_query||e.tls_sni||e.domain||'—')+'</td><td>'+fmtBytes(e.bytes)+'</td></tr>').join('')||'<tr><td colspan="6" class="empty">No new packet events.</td></tr>';
- $('obsPacketFlows').innerHTML=(r.flows||[]).map(f=>'<tr><td>'+esc(new Date(Number(f.first_timestamp_ns)/1e6).toLocaleTimeString())+'</td><td>'+esc(new Date(Number(f.last_timestamp_ns)/1e6).toLocaleTimeString())+'</td><td class="mono">'+esc(f.client_ip||'—')+' → '+esc(f.remote_ip||'—')+'</td><td>'+esc(f.protocol||'')+'</td><td>'+Number(f.packets||0)+' / '+fmtBytes(f.bytes)+'</td><td>'+fmtRate(Number(f.bytes_per_second)||0)+'</td></tr>').join('')||'<tr><td colspan="6" class="empty">No active flows.</td></tr>';
+ const flows=r.flows||[];
+  $('obsPacketFlows').innerHTML=flows.map(f=>'<tr data-flow-select="'+esc(f.flow_id||'')+'" style="cursor:pointer"><td>'+esc(new Date(Number(f.first_timestamp_ns)/1e6).toLocaleTimeString())+'</td><td>'+esc(new Date(Number(f.last_timestamp_ns)/1e6).toLocaleTimeString())+'</td><td class="mono">'+esc(f.client_ip||'—')+':'+esc(f.client_port??'—')+' → '+esc(f.remote_ip||'—')+':'+esc(f.remote_port??'—')+'</td><td>'+esc(f.protocol||'')+'</td><td>'+Number(f.packets||0)+' / '+fmtBytes(f.bytes)+'</td><td>'+(f.sample_valid&&Number.isFinite(Number(f.bytes_per_second))?fmtRate(Number(f.bytes_per_second)):'—')+'</td></tr>').join('')||'<tr><td colspan="6" class="empty">No active flows.</td></tr>';
+  const select=$('obsFlowSelect'),previous=selectedFlowId,seriesFlows=flows.filter(f=>f.series_available);
+  select.replaceChildren();
+  seriesFlows.forEach(f=>{const option=document.createElement('option');option.value=f.flow_id;option.textContent=(f.client_ip||'Unknown')+':'+(f.client_port??'?')+' → '+(f.remote_ip||'Unknown')+':'+(f.remote_port??'?')+' · '+(f.protocol||'IP');select.appendChild(option);});
+  const chosen=seriesFlows.find(f=>f.flow_id===previous)||seriesFlows[0];
+  selectedFlowId=chosen?.flow_id||'';select.value=selectedFlowId;select.disabled=!selectedFlowId;
+  if(selectedFlowId)await refreshFlowSeries(selectedFlowId);else{flowSeriesSamples=[];drawFlowSeriesChart();$('obsFlowChartStatus').textContent=flows.length?'No series slot allocated for current flows.':'No active flows to graph.';}
+  const fs=c.flow_sampling||{};$('obsFlowChartLatest').title='Tracked '+(fs.tracked_series||0)+' of '+(fs.active_flows||0)+' active flows; '+(fs.untracked_series_flows||0)+' flow series not retained.';
  $('obsDnsIndicators').innerHTML=(r.dns_bypass_events||[]).map(e=>'<div class="kv"><span>'+esc(e.timestamp)+' · '+esc(e.client?.label||e.client?.ip||'Unknown')+' · '+esc(e.type)+'</span><strong>'+esc(e.evidence)+' · outcome '+esc(e.enforcement_outcome)+'</strong></div>').join('')||'<div class="empty">No DNS indicators in this event batch.</div>';
  }catch(e){if(showErrors)showToast(e.message,true);}
 }
@@ -1069,6 +1155,9 @@ document.body.addEventListener('click',async event=>{
  if(label){const mac=label.dataset.deviceLabel;if(!mac)return;const value=prompt('Local device label (leave blank to clear):');if(value===null)return;try{const result=await executeAdminAction(value.trim()?{action:'network_label',mac,label:value.trim()}:{action:'network_unlabel',mac},'Change a local device label. Enter the Linux sudo password to authorize.');if(result)await refreshNetworkObservability(false);}catch(error){showToast(error.message,true);}}
 });
 $('obsRefresh').addEventListener('click',()=>refreshNetworkObservability());$('obsCaptureRefresh').addEventListener('click',()=>refreshPacketCapture());$('obsDnsRefresh').addEventListener('click',()=>refreshDnsQueryLog());
+ $('obsFlowSelect').addEventListener('change',()=>refreshFlowSeries($('obsFlowSelect').value));
+ $('obsPacketFlows').addEventListener('click',event=>{const row=event.target.closest('[data-flow-select]');if(row?.dataset.flowSelect){$('obsFlowSelect').value=row.dataset.flowSelect;refreshFlowSeries(row.dataset.flowSelect);}});
+ bindFlowChartTooltip();
 $('obsScanBtn').addEventListener('click',async()=>{const interfaces=[...$('obsCaptureInterfaces').selectedOptions].map(o=>o.value);if(!interfaces.length){showToast('Select configured AP interfaces first.',true);return;}try{const r=await executeAdminAction({action:'network_scan',interfaces},'Run active discovery only on configured private AP networks. Enter the Linux sudo password to authorize.');if(r)$('obsScanResult').textContent=JSON.stringify(r,null,2);}catch(e){showToast(e.message,true);}});
 $('obsCaptureStart').addEventListener('click',async()=>{const interfaces=[...$('obsCaptureInterfaces').selectedOptions].map(o=>o.value);if(!interfaces.length){showToast('Select one or more capture interfaces.',true);return;}const save_pcap=$('obsSavePcap').checked,duration_seconds=Number($('obsCaptureDuration').value);if(save_pcap&&!confirm('PCAPNG can contain private traffic data. It is capped at 300 seconds and 32 MiB. Continue?'))return;try{const r=await executeAdminAction({action:'packet_capture_start',interfaces,duration_seconds,save_pcap},'Start bounded packet metadata capture on the selected interfaces. Enter the Linux sudo password to authorize.');if(r){packetEventCursor=0;showToast('Packet capture started.');await refreshPacketCapture();}}catch(e){showToast(e.message,true);}});
 $('obsCaptureStop').addEventListener('click',async()=>{try{await api('/api/action',{method:'POST',body:JSON.stringify({action:'packet_capture_stop'})});showToast('Capture stopped.');await refreshPacketCapture();}catch(e){showToast(e.message,true);}});
