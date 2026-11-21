@@ -778,7 +778,46 @@ class Handler(BaseHTTPRequestHandler):
             auth = self.require_session()
             if not auth:
                 return
-            result = agent_request({'action': 'telemetry'}, timeout=5)
+            query = urllib.parse.parse_qs(parsed.query, keep_blank_values=False)
+            try:
+                after = int(query.get('after', ['0'])[0])
+                limit = int(query.get('limit', ['900'])[0])
+                if after < 0 or not 1 <= limit <= 900:
+                    raise ValueError
+            except (TypeError, ValueError):
+                self.send_json(400, {'ok': False, 'error': 'Invalid telemetry cursor or limit.'})
+                return
+            result = agent_request({'action': 'telemetry', 'after_sequence': after, 'limit': limit}, timeout=5)
+            self.send_json(200 if result.get('ok') else 503, result)
+            return
+        if path == '/api/network-observability':
+            auth = self.require_session()
+            if not auth:
+                return
+            result = agent_request({'action': 'network_inventory'}, timeout=20)
+            self.send_json(200 if result.get('ok') else 503, result)
+            return
+        if path == '/api/packet-capture':
+            auth = self.require_session()
+            if not auth:
+                return
+            query = urllib.parse.parse_qs(parsed.query, keep_blank_values=False)
+            try:
+                after = int(query.get('after', ['0'])[0])
+                limit = int(query.get('limit', ['200'])[0])
+                if after < 0 or not 0 <= limit <= 250:
+                    raise ValueError
+            except (TypeError, ValueError):
+                self.send_json(400, {'ok': False, 'error': 'Invalid packet event cursor or limit.'})
+                return
+            result = agent_request({'action': 'packet_capture_snapshot', 'after': after, 'limit': limit}, timeout=5)
+            self.send_json(200 if result.get('ok') else 503, result)
+            return
+        if path == '/api/dns-query-log':
+            auth = self.require_session()
+            if not auth:
+                return
+            result = agent_request({'action': 'dns_query_log', 'limit': 50}, timeout=5)
             self.send_json(200 if result.get('ok') else 503, result)
             return
         if path == '/api/job':
@@ -1169,6 +1208,19 @@ class Handler(BaseHTTPRequestHandler):
                 payload = {'action': 'portal_update_source', 'repo': data.get('repo')}
             elif action == 'portal_update_check':
                 payload = {'action': 'portal_update_check'}
+            elif action == 'network_scan':
+                payload = {'action': 'network_scan', 'interfaces': data.get('interfaces')}
+            elif action == 'packet_capture_start':
+                payload = {'action': 'packet_capture_start', 'duration_seconds': data.get('duration_seconds'),
+                           'interfaces': data.get('interfaces'), 'save_pcap': data.get('save_pcap', False)}
+            elif action == 'packet_capture_stop':
+                payload = {'action': 'packet_capture_stop'}
+            elif action == 'packet_analyse':
+                payload = {'action': 'packet_analyse', 'name': data.get('name')}
+            elif action == 'network_label':
+                payload = {'action': 'network_label', 'mac': data.get('mac'), 'label': data.get('label')}
+            elif action == 'network_unlabel':
+                payload = {'action': 'network_unlabel', 'mac': data.get('mac')}
             else:
                 self.send_json(400, {'ok': False, 'error': 'Unsupported action.'})
                 return
