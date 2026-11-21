@@ -121,7 +121,7 @@ agent_client_slots = threading.BoundedSemaphore(AGENT_CLIENT_LIMIT)
 PRIVILEGED_ACTIONS = {
     'service', 'update_job', 'wifi_config', 'backup_create', 'reboot', 'poweroff',
     'portal_update_source', 'logs', 'backup_download', 'network_scan',
-    'packet_capture_start', 'network_label', 'network_unlabel',
+    'packet_capture_start', 'network_fingerprint', 'network_label', 'network_unlabel',
 }
 
 
@@ -206,6 +206,8 @@ def privilege_scope(intent: Any) -> dict[str, Any] | None:
     if action == 'network_scan':
         interfaces = network_observability.validate_scan_interfaces(intent.get('interfaces'))
         return {'action': action, 'interfaces': interfaces} if interfaces else None
+    if action == 'network_fingerprint':
+        return network_observability.fingerprint(req.get('address'))
     if action == 'packet_capture_start':
         duration = intent.get('duration_seconds')
         interfaces = network_observability.validate_capture_interfaces(intent.get('interfaces'))
@@ -215,6 +217,9 @@ def privilege_scope(intent: Any) -> dict[str, Any] | None:
         if not interfaces or not isinstance(save_pcap, bool) or (save_pcap and duration > 300):
             return None
         return {'action': action, 'duration_seconds': duration, 'interfaces': interfaces, 'save_pcap': save_pcap}
+    if action == 'network_fingerprint':
+        address = network_observability.validate_fingerprint_address(intent.get('address'))
+        return {'action': action, 'address': address} if address else None
     if action in {'network_label', 'network_unlabel'}:
         mac = intent.get('mac')
         label = intent.get('label', '')
