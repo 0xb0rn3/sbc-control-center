@@ -33,6 +33,8 @@ from pathlib import Path
 from typing import Any
 
 import telemetry
+import realtime_telemetry
+import network_observability
 import pam_auth
 
 BASE = Path('/etc/sbc-control-center')
@@ -118,7 +120,8 @@ agent_client_slots = threading.BoundedSemaphore(AGENT_CLIENT_LIMIT)
 
 PRIVILEGED_ACTIONS = {
     'service', 'update_job', 'wifi_config', 'backup_create', 'reboot', 'poweroff',
-    'portal_update_source', 'logs', 'backup_download',
+    'portal_update_source', 'logs', 'backup_download', 'network_scan',
+    'packet_capture_start', 'network_label', 'network_unlabel',
 }
 
 
@@ -200,6 +203,26 @@ def privilege_scope(intent: Any) -> dict[str, Any] | None:
     if action == 'backup_download':
         name = intent.get('name')
         return {'action': action, 'name': name} if isinstance(name, str) and re.fullmatch(r'sbc-control-config-[0-9]{8}T[0-9]{6}Z\.tar\.gz', name) else None
+    if action == 'network_scan':
+        interfaces = network_observability.validate_scan_interfaces(intent.get('interfaces'))
+        return {'action': action, 'interfaces': interfaces} if interfaces else None
+    if action == 'packet_capture_start':
+        duration = intent.get('duration_seconds')
+        interfaces = network_observability.validate_capture_interfaces(intent.get('interfaces'))
+        save_pcap = intent.get('save_pcap', False)
+        if isinstance(duration, bool) or not isinstance(duration, int) or not 10 <= duration <= 600:
+            return None
+        if not interfaces or not isinstance(save_pcap, bool) or (save_pcap and duration > 300):
+            return None
+        return {'action': action, 'duration_seconds': duration, 'interfaces': interfaces, 'save_pcap': save_pcap}
+    if action in {'network_label', 'network_unlabel'}:
+        mac = intent.get('mac')
+        label = intent.get('label', '')
+        if not isinstance(mac, str) or not re.fullmatch(r'(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}', mac):
+            return None
+        if action == 'network_label' and (not isinstance(label, str) or not label.strip() or len(label) > 64 or any(ord(ch) < 32 for ch in label)):
+            return None
+        return {'action': action, 'mac': mac.lower(), 'label': label.strip() if isinstance(label, str) else ''}
     if action == 'console':
         command = intent.get('command')
         return {'action': action, 'command': command} if isinstance(command, str) and console_requires_privilege(command) else None
@@ -613,6 +636,12 @@ def load_config() -> dict[str, Any]:
 
 
 CFG = load_config()
+try:
+    network_observability.configure(CFG)
+except Exception:
+    pass
+telemetry_sampler = realtime_telemetry.RealtimeSampler(telemetry.snapshot, capacity=900, interval_seconds=1.0)
+
 # The configured WireGuard unit is added to fixed service registries only after
 # validating its systemd unit name. No caller-supplied unit reaches systemctl.
 _configured_vpn_unit = CFG['vpn_unit']
@@ -1251,8 +1280,46 @@ def do_action(req: dict[str, Any]) -> dict[str, Any]:
     if action == 'status':
         return {'ok': True, 'data': get_status()}
     if action == 'telemetry':
-        with telemetry_lock:
-            return {'ok': True, 'telemetry': telemetry.snapshot()}
+        try:
+            return {'ok': True, 'telemetry': telemetry_sampler.read(
+                after_sequence=req.get('after_sequence', 0), limit=req.get('limit', 900))}
+        except (TypeError, ValueError) as exc:
+            return {'ok': False, 'error': str(exc)}
+    if action == 'network_inventory':
+        try:
+            return {'ok': True, 'network': network_observability.inventory()}
+        except Exception as exc:
+            return {'ok': False, 'error': str(exc)[:240]}
+    if action == 'network_scan':
+        return network_observability.scan(req.get('interfaces'))
+    if action == 'packet_capture_start':
+        try:
+            return network_observability.capture_start(req.get('duration_seconds'), req.get('interfaces'), req.get('save_pcap', False))
+        except Exception as exc:
+            return {'ok': False, 'error': str(exc)[:240]}
+    if action == 'packet_capture_stop':
+        try:
+            return network_observability.capture_stop()
+        except Exception as exc:
+            return {'ok': False, 'error': str(exc)[:240]}
+    if action == 'packet_capture_snapshot':
+        try:
+            after, limit = req.get('after', 0), req.get('limit', 200)
+            if isinstance(after, bool) or not isinstance(after, int) or after < 0 or isinstance(limit, bool) or not isinstance(limit, int) or not 0 <= limit <= 250:
+                return {'ok': False, 'error': 'Invalid packet event cursor or limit.'}
+            return network_observability.capture_snapshot(after, limit)
+        except Exception as exc:
+            return {'ok': False, 'error': str(exc)[:240]}
+    if action == 'packet_analyse':
+        return network_observability.analyse_capture(req.get('name'))
+    if action == 'dns_status':
+        return network_observability.dns_status()
+    if action == 'dns_query_log':
+        return network_observability.dns_query_log(req.get('limit', 50))
+    if action == 'network_label':
+        return network_observability.set_client_label(req.get('mac'), req.get('label'))
+    if action == 'network_unlabel':
+        return network_observability.remove_client_label(req.get('mac'))
     if action == 'job_status':
         return {'ok': True, 'job': get_job()}
     if action == 'portal_update_status':
@@ -1356,6 +1423,7 @@ def handle_client(conn: socket.socket) -> None:
 
 
 def main() -> None:
+    telemetry_sampler.start()
     threading.Thread(target=portal_update_scheduler, daemon=True, name='portal-update-scheduler').start()
     SOCKET_DIR.mkdir(mode=0o750, parents=True, exist_ok=True)
     try:
