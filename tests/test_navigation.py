@@ -61,10 +61,10 @@ class NavigationMarkupTests(unittest.TestCase):
         missing = self.parser.nav_targets - self.parser.sections
         self.assertEqual(missing, set(), f"Navigation points to missing sections: {missing}")
 
-    def test_navigation_center_covers_all_eleven_sections(self):
+    def test_navigation_center_covers_all_twelve_sections(self):
         expected = {
             "overview", "telemetry", "network", "storage", "services", "updates",
-            "backups", "logs", "terminal", "firewall", "system",
+            "backups", "logs", "terminal", "firewall", "system", "security-operations",
         }
         self.assertEqual(self.parser.center_targets, expected)
 
