@@ -70,6 +70,8 @@ def capture_snapshot(after=0,limit=200):
  c=r['capture']
  if c.get('pcapng_path'):c['pcapng_name']=Path(c['pcapng_path']).name;c.pop('pcapng_path',None)
  return r
+def flow_series(flow_id,limit=60):
+ _ensure();return _monitor.flow_series(flow_id,limit)
 def analyse_capture(name):
  _ensure()
  if not isinstance(name,str) or Path(name).name!=name or not re.fullmatch(r'sbc-control-center-[0-9]{8}T[0-9]{6}Z-[0-9]+\.pcapng',name):return {'ok':False,'error':'Invalid capture identifier.'}
