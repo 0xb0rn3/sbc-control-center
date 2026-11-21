@@ -3,6 +3,7 @@ import dns_bypass_sensor
 import network_discovery
 import device_intelligence
 import flow_telemetry
+import packet_analysis
 
 
 class NetworkDiscoveryScopeTests(unittest.TestCase):
@@ -158,6 +159,59 @@ class FlowRateTrackerTests(unittest.TestCase):
     def test_invalid_flow_ids_and_history_limits_are_rejected(self):
         self.assertFalse(self.tracker.series("../etc/passwd")["ok"])
         self.assertFalse(self.tracker.series(flow_telemetry.FlowRateTracker.make_flow_id(self.metadata), limit=0)["ok"])
+
+
+
+class PacketAnalysisSummaryTests(unittest.TestCase):
+    def test_tshark_rows_produce_protocol_endpoint_and_conversation_summaries(self):
+        rows = [
+            {
+                "frame.number": "1", "frame.time_epoch": "1700000000.0",
+                "frame.time_delta_displayed": "0.0", "frame.len": "100",
+                "frame.protocols": "eth:ethertype:ip:tcp:tls",
+                "ip.src": "10.77.0.22", "ip.dst": "203.0.113.10",
+                "tcp.srcport": "51000", "tcp.dstport": "443",
+                "tcp.stream": "0", "tcp.analysis.retransmission": "",
+                "dns.qry.name": "", "tls.handshake.extensions_server_name": "example.org",
+            },
+            {
+                "frame.number": "2", "frame.time_epoch": "1700000000.5",
+                "frame.time_delta_displayed": "0.5", "frame.len": "150",
+                "frame.protocols": "eth:ethertype:ip:tcp:tls",
+                "ip.src": "203.0.113.10", "ip.dst": "10.77.0.22",
+                "tcp.srcport": "443", "tcp.dstport": "51000",
+                "tcp.stream": "0", "tcp.analysis.retransmission": "1",
+                "dns.qry.name": "", "tls.handshake.extensions_server_name": "",
+            },
+            {
+                "frame.number": "3", "frame.time_epoch": "1700000001.0",
+                "frame.time_delta_displayed": "0.5", "frame.len": "80",
+                "frame.protocols": "eth:ethertype:ip:udp:dns",
+                "ip.src": "10.77.0.22", "ip.dst": "10.77.0.1",
+                "udp.srcport": "53000", "udp.dstport": "53",
+                "tcp.stream": "", "tcp.analysis.retransmission": "",
+                "dns.qry.name": "example.net", "tls.handshake.extensions_server_name": "",
+            },
+        ]
+        summary = packet_analysis._summarize_rows(rows)
+        layers = dict(summary["protocol_layers"])
+        self.assertEqual(layers["tcp"], 2)
+        self.assertEqual(layers["dns"], 1)
+        self.assertEqual(summary["tcp_analysis"]["tcp.analysis.retransmission"], 1)
+        self.assertEqual(summary["tls_server_names"], [("example.org", 1)])
+        self.assertEqual(summary["dns_names"], [("example.net", 1)])
+        self.assertEqual(summary["capture_time"]["duration_seconds"], 1.0)
+        conversations = summary["top_conversations"]
+        tcp = next(item for item in conversations if item["transport"] == "TCP")
+        self.assertEqual(tcp["packets"], 2)
+        self.assertEqual(tcp["bytes"], 250)
+
+    def test_tshark_summary_handles_empty_capture(self):
+        summary = packet_analysis._summarize_rows([])
+        self.assertEqual(summary["protocol_layers"], [])
+        self.assertEqual(summary["top_conversations"], [])
+        self.assertIsNone(summary["capture_time"]["first_epoch"])
+        self.assertEqual(summary["capture_time"]["duration_seconds"], 0.0)
 
 
 if __name__ == '__main__':
