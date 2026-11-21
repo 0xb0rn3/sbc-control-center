@@ -22,6 +22,7 @@ SBC Control Center is a self-hosted web interface for monitoring and administeri
 - Responsive administration portal with desktop sidebar, searchable navigation center and compact mobile navigation.
 - Live telemetry samples Linux `/proc` and `/sys` on a privileged-agent-owned, non-overlapping one-second schedule, independent of browser polling: total/per-core CPU utilization, available CPU frequencies, RAM and swap, board thermal sensors, disk read/write throughput, process count, load average, kernel PSI pressure, and per-interface RX/TX bytes/s, packets/s, errors and drops. Rates use actual monotonic elapsed intervals and every sample carries its UTC acquisition timestamp. It also reports GPU/NPU frequency or utilization when the board's DRM/devfreq driver exports those metrics. Desktop and mobile trend charts preserve measured sample times and can be filtered by interface. Per-flow upload/download B/s and packets/s use a separate bounded one-second sampler, per-flow timestamped history and actual interval measurements; lifetime averages are labelled separately.
 - Two-radio `hostapd` access-point view and configuration workflow for the current tested router-style profile.
+- Live Security Operations map for captured public endpoints, geographic clustering, a UTC incident timeline, local-only IP reputation/GeoIP enrichment and authenticated packet-metadata evidence drill-down. Packet capture must be explicitly started; the feature does not silently open capture sockets or automatically block traffic.
 - Service status and explicitly allow-listed start/stop/restart operations.
 - WireGuard tunnel status and allow-listed service controls.
 - Admin diagnostic console with fixed argument arrays, bounded output and read-only commands. Root-only diagnostics request a fresh Linux sudo password. It is **not** an unrestricted shell.
@@ -29,6 +30,24 @@ SBC Control Center is a self-hosted web interface for monitoring and administeri
 - Password login, TOTP support and WebAuthn passkey login. HTTPS is enforced: the application starts only with a valid certificate/key, serves TLS 1.2 or newer, has no plaintext HTTP listener, and sends HSTS on HTTPS responses. Passkeys require a trusted HTTPS origin and a stable DNS hostname.
 - Timestamped configuration snapshots. Creating or downloading a backup, which can contain Wi-Fi credentials, requires fresh sudo-password verification.
 - Dark, low-glare design with the project background artwork applied across the interface.
+
+
+
+## Security operations, threat map and packet evidence
+
+The network-observability branch adds an authenticated Security Operations view built on the existing bounded live packet-capture ring.
+
+- **Live endpoint map:** public remote endpoints observed in packet metadata are plotted using an optional local GeoLite2 City database. Nearby points are grouped into geographic clusters. The marker is an approximate IP network endpoint, not a verified person or attacker location.
+- **Live event refresh:** the view polls the authenticated packet-event snapshot every 10 seconds while the section is visible. Packet capture must be explicitly started in Network observability; the map does not silently open capture sockets.
+- **24-hour timeline:** packet timestamps are normalized to UTC and grouped into hourly buckets. Selecting a bucket filters the retained event table.
+- **Packet evidence drill-down:** select a marker or event row to inspect the exact retained decoded metadata record: timestamp, direction, interface, client/source, remote IP, ports, protocol/application, DNS query/response fields, TLS SNI, flow ID and any DNS-bypass indicator.
+- **Geographic clustering:** clustering is performed locally in the browser; it does not send event data to a map provider.
+- **Local-only enrichment:** install the optional `geoip2` Python package and place a valid GeoLite2 City database at `/usr/share/GeoIP/GeoLite2-City.mmdb`. Without it, event history and packet evidence still work, but no geographic markers are drawn. No remote GeoIP service or tile provider is contacted.
+- **Reputation snapshots:** optional local indicators are read from `/var/lib/sbc-control-center/threat-intel/reputation.json` using `{"cidrs":["8.8.8.0/24"],"domains":["example.invalid"]}`. Feed acquisition is intentionally out-of-band; this branch does not download feeds.
+- **Safe interpretation:** only globally routable IP endpoints are geolocated. Private, documentation, link-local, loopback and reserved ranges are excluded. Reputation matches are indicators, not proof of compromise. Automatic blocking is disabled.
+- **Capture limitations:** the packet inspector retains decoded metadata in a bounded in-memory ring and does not expose packet payload bytes. Evidence can disappear when the ring overwrites old entries or the service restarts. Full PCAPNG capture remains explicit, bounded and separately protected.
+
+The threat map is a view of observed network endpoints, not an inbound-attack attribution map. DNS/DoT/DoQ/DoH indicators describe packet observations; they do not automatically prove that traffic bypassed firewall or DNS redirection policy.
 
 ## Current platform and scope
 
