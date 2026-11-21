@@ -76,7 +76,7 @@ def enrich_clients(rows,**kwargs):
   if not isinstance(r,dict):continue
   m=normalize_mac(r.get('mac'));key=m or ('ip:'+str(r.get('ip')) if r.get('ip') else None)
   if key:merged.setdefault(key,{}).update(r)
- labels=load_labels();db=kwargs.get('database')
+ labels=load_labels();db=kwargs.get('database') or _db()
  return [enrich_client(x,db,labels) for x in merged.values()]
 def remember_observation(*a,**k):return None
 def recent_observations(*a,**k):return []
