@@ -248,7 +248,8 @@ class FlowRateTracker:
                 "flows_sampled": sampled,
                 "active_flows": len(self._flows),
                 "tracked_series": len(self._series),
-                "untracked_series_flows": self._untracked_series,
+                "untracked_series_flows": sum(1 for flow_id in self._flows if flow_id not in self._series),
+                "untracked_series_created": self._untracked_series,
             }
 
     def summary(self, limit: int = 100) -> list[dict[str, Any]]:
