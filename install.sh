@@ -60,7 +60,7 @@ if [[ -r /etc/os-release ]]; then
 fi
 
 SRC="${SBC_CONTROL_CENTER_SOURCE:-$(cd "$(dirname "$0")" && pwd)}"
-if [[ ! -f "$SRC/agent.py" || ! -f "$SRC/web.py" || ! -f "$SRC/telemetry.py" || ! -f "$SRC/pam_auth.py" || ! -f "$SRC/index.html" || ! -f "$SRC/assets/ui-background.png" ]]; then
+if [[ ! -f "$SRC/agent.py" || ! -f "$SRC/web.py" || ! -f "$SRC/telemetry.py" || ! -f "$SRC/realtime_telemetry.py" || ! -f "$SRC/network_observability.py" || ! -f "$SRC/packet_monitor.py" || ! -f "$SRC/packet_analysis.py" || ! -f "$SRC/device_intelligence.py" || ! -f "$SRC/network_discovery.py" || ! -f "$SRC/wireless_adapter.py" || ! -f "$SRC/dns_filter.py" || ! -f "$SRC/dns_bypass_sensor.py" || ! -f "$SRC/pam_auth.py" || ! -f "$SRC/index.html" || ! -f "$SRC/assets/ui-background.png" ]]; then
   echo "SBC Control Center source files were not found in: $SRC" >&2
   exit 1
 fi
@@ -76,7 +76,7 @@ PY
 
 printf '\n[1/7] Installing required packages...\n'
 apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-fido2 openssl iw nftables iproute2 procps util-linux wireguard-tools curl sudo libpam0g
+DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-fido2 openssl iw nftables iproute2 procps util-linux wireguard-tools curl sudo libpam0g arp-scan nmap tshark p0f arpwatch avahi-utils
 
 printf '\n[2/7] Creating restricted portal account...\n'
 getent group "$GROUP" >/dev/null || groupadd --system "$GROUP"
@@ -88,6 +88,9 @@ install -d -o root -g "$GROUP" -m 0750 "$APP_DIR" "$ETC_DIR" "$STATE_DIR"
 install -d -o "$USER" -g "$GROUP" -m 0700 /var/lib/sbc-control-center-web
 install -o root -g root -m 0755 "$SRC/agent.py" "$APP_DIR/agent.py"
 install -o root -g root -m 0644 "$SRC/telemetry.py" "$APP_DIR/telemetry.py"
+for module in realtime_telemetry network_observability packet_monitor packet_analysis device_intelligence network_discovery wireless_adapter dns_filter dns_bypass_sensor; do
+  install -o root -g root -m 0644 "$SRC/$module.py" "$APP_DIR/$module.py"
+done
 install -o root -g root -m 0644 "$SRC/pam_auth.py" "$APP_DIR/pam_auth.py"
 install -o root -g root -m 0755 "$SRC/web.py" "$APP_DIR/web.py"
 install -o root -g root -m 0644 "$SRC/index.html" "$APP_DIR/index.html"
@@ -229,7 +232,8 @@ ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
+AmbientCapabilities=CAP_NET_RAW
 SystemCallArchitectures=native
 ReadWritePaths=/etc/sbc-control-center /var/lib/sbc-control-center /run/sbc-control-center -/etc/hostapd -/etc/dnsmasq.d -/etc/apguard.nft -/etc/systemd/system/ap-iface.service -/etc/systemd/system/ap2-iface.service -/etc/systemd/system/apguard.service -/etc/systemd/system/hostapd-2g.service -/etc/systemd/system/multi-user.target.wants
 [Install]
