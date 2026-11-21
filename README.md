@@ -130,3 +130,27 @@ Browser screenshots are in `docs/screenshots/`. CI runs the Python test suite, P
 ## License
 
 MIT
+
+
+## Network observability and timestamped telemetry
+
+The network observability feature set is implemented as a backend-to-UI pipeline, not a browser-generated simulation:
+
+- A privileged-agent-owned sampler reads Linux `/sys/class/net/*/statistics` independently of browser polling. It keeps a bounded 15-minute ring (900 nominal one-second samples) and serves incremental sequence cursors.
+- Each sample carries UTC acquisition time, Unix nanoseconds, monotonic nanoseconds, actual elapsed interval, raw cumulative counters, byte/packet deltas, and rates computed as delta divided by the measured monotonic interval.
+- Counter resets, first samples, missing physical interfaces and stale sampler state are represented as unavailable rather than fabricated zero traffic. Physical totals exclude common virtual, bridge, tunnel and stacked links where sysfs topology identifies them.
+- Graph x-coordinates use backend acquisition timestamps. Network series use the network-counter read timestamp; CPU, memory and other host series use their own sample timestamp. Tooltips show local time and UTC.
+- The client inventory combines configured AP DHCP leases, kernel neighbour entries and Wi-Fi station information. IEEE OUI attribution is suppressed for locally administered/randomized MAC addresses.
+- Active ARP discovery and per-client Nmap fingerprinting are restricted to the configured private AP networks and require fresh administrator verification.
+- Packet capture is an explicit AF_PACKET operation on a configured interface allowlist. Metadata-only capture is the default; full PCAPNG is separately opted into, restricted to a root-owned private directory, and capped at 300 seconds / 32 MiB.
+- TShark is used only for bounded offline analysis of completed application-owned captures. Packet payloads are not returned by the normal event API.
+- DNS bypass signals are evidence indicators. A packet observed before AP DNAT is not proof that an external resolver was reached or that filtering was bypassed.
+- AdGuard Home integration is optional and read-only in this release: local status and bounded query-log inspection. It does not automatically rewrite firewall rules, DHCP settings or resolver profiles.
+
+### Installation dependencies
+
+The installer installs `arp-scan`, `nmap`, `tshark`, `p0f`, `arpwatch`, `avahi-utils` and `ieee-data` alongside the base portal dependencies. Optional tools are reported as unavailable when missing. AF_PACKET requires Linux and the privileged agent's CAP_NET_RAW capability.
+
+### Measurement boundaries
+
+Interface byte rates are aggregate kernel-counter deltas over measured intervals. They are not per-packet or per-byte timestamps. Packet events use the kernel receive timestamp when SO_TIMESTAMPNS is available and otherwise use the userspace receive time. Capture length is the L3 packet size exposed by AF_PACKET SOCK_DGRAM, not an Ethernet wire-length counter. Wi-Fi monitor-mode management/control frames are not enabled automatically.
