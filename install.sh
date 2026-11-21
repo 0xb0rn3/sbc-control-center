@@ -76,7 +76,7 @@ PY
 
 printf '\n[1/7] Installing required packages...\n'
 apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-fido2 openssl iw nftables iproute2 procps util-linux wireguard-tools curl sudo libpam0g arp-scan nmap tshark p0f arpwatch avahi-utils
+DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-fido2 openssl iw nftables iproute2 procps util-linux wireguard-tools curl sudo libpam0g arp-scan nmap tshark p0f arpwatch avahi-utils ieee-data
 
 printf '\n[2/7] Creating restricted portal account...\n'
 getent group "$GROUP" >/dev/null || groupadd --system "$GROUP"
