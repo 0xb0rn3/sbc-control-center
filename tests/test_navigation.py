@@ -109,6 +109,17 @@ class NavigationMarkupTests(unittest.TestCase):
         self.assertIn('packets per second', self.source.lower())
         self.assertIn('does not capture packet payloads', self.source)
 
+    def test_per_flow_graph_uses_timestamped_backend_samples(self):
+        self.assertIn('id="obsFlowSelect"', self.source)
+        self.assertIn('id="obsFlowChart"', self.source)
+        self.assertIn('/api/packet-flow-series?flow_id=', self.source)
+        self.assertIn("Date.parse(row.timestamp)", self.source)
+        self.assertIn("sample.interval_seconds", self.source)
+        self.assertIn("sample.upload_bytes_per_second", self.source)
+        self.assertIn("sample.download_bytes_per_second", self.source)
+        self.assertIn("Current B/s", self.source)
+        self.assertNotIn("Flow byte rate is an average over the observed flow lifetime", self.source)
+
     def test_admin_sensitive_actions_use_step_up_verification(self):
         self.assertIn("'logs','backup_download'", self.source)
         self.assertIn("/api/privilege/authorize", self.source)
