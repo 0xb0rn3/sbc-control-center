@@ -141,7 +141,7 @@ class RealtimeSampler:
                         totals[rate_key] += delta / elapsed
             interfaces.append(item)
         # Counter reset or first sample: report unavailable, never manufacture zero traffic.
-        if not interfaces or any(row['included_in_total'] and not row['sample_valid'] for row in interfaces):
+        if not any(row['included_in_total'] for row in interfaces) or any(row['included_in_total'] and not row['sample_valid'] for row in interfaces):
             aggregate_valid = False
         self._previous_rows = copy.deepcopy(counters)
         self._previous_counter_mono_ns = mono_ns
