@@ -1315,6 +1315,16 @@ def do_action(req: dict[str, Any]) -> dict[str, Any]:
             return network_observability.capture_snapshot(after, limit)
         except Exception as exc:
             return {'ok': False, 'error': str(exc)[:240]}
+    if action == 'packet_flow_series':
+        flow_id, limit = req.get('flow_id'), req.get('limit', 60)
+        if not isinstance(flow_id, str) or not re.fullmatch(r'[0-9a-f]{24}', flow_id):
+            return {'ok': False, 'error': 'Invalid flow identifier.'}
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 60:
+            return {'ok': False, 'error': 'Invalid flow history limit.'}
+        try:
+            return network_observability.flow_series(flow_id, limit)
+        except Exception as exc:
+            return {'ok': False, 'error': str(exc)[:240]}
     if action == 'packet_analyse':
         return network_observability.analyse_capture(req.get('name'))
     if action == 'dns_status':
