@@ -38,7 +38,8 @@ class SecurityOperationsTests(unittest.TestCase):
 
     def test_reputation_match_is_indicator_only(self):
         so.FEED_PATH.write_text('{"cidrs":["8.8.8.0/24"],"domains":[]}', encoding="utf-8")
-        rows = so.enrich_events([{"remote_ip":"8.8.8.8","dns_query":"example.com"}])
+        snapshot = so.snapshot_from_capture({"events":[{"remote_ip":"8.8.8.8","dns_query":"example.com"}]})
+        rows = snapshot["events"]
         self.assertEqual(rows[0]["confidence"], "feed_match")
         self.assertEqual(rows[0]["severity"], "high")
         self.assertEqual(rows[0]["automatic_action"], "none")
