@@ -79,6 +79,7 @@ USER_AGENT = 'SBCControlCenter'
 
 DEFAULTS: dict[str, str] = {
     'device_label': 'SBC Control Center',
+    'greeting_name': '',            # living-room greeting: "Good evening, <name>" (empty: no name)
     'uplink_interface': 'end0',
     'ap_interface': 'wlan1',
     'ap_label': '5 GHz access point',

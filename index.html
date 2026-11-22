@@ -425,6 +425,7 @@ pre { max-height: 430px; margin: 0; padding: 12px; overflow: auto; border: 1px s
 </style>
 <link rel="stylesheet" href="/assets/vendor/xterm.css">
 <link rel="stylesheet" href="/assets/ui/livingroom.css">
+<link rel="stylesheet" href="/assets/ui/quote-fonts.css">
 <script src="/assets/ui/slideshow.js"></script>
 <script src="/assets/ui/quotes.js"></script>
 <script src="/assets/ui/livingroom.js"></script>
@@ -1641,7 +1642,7 @@ function enterStandby(fromUser=false){
   if(standbyActive)return;standbyActive=true;
   document.body.classList.add('standby');$('standbyOverlay').hidden=false;$('standbyHint').hidden=false;
   clearTimeout(standbyHintTimer);standbyHintTimer=setTimeout(()=>{$('standbyHint').hidden=true;},4000);
-  if(window.SbcLivingRoom&&!livingRoom)livingRoom=SbcLivingRoom.mount($('standbyOverlay'),{label:SITE.device_label});
+  if(window.SbcLivingRoom&&!livingRoom)livingRoom=SbcLivingRoom.mount($('standbyOverlay'),{name:SITE.greeting_name,label:SITE.device_label});
   pausePollingForStandby();
   applyDisplaySettings();
   if(fromUser&&document.documentElement.requestFullscreen&&!document.fullscreenElement)document.documentElement.requestFullscreen().catch(()=>{});

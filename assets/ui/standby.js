@@ -7,5 +7,5 @@
   var seconds = q ? Math.min(3600, Math.max(10, parseInt(q[1], 10))) : 30;
   var show = new window.SbcSlideshow(document.getElementById('backdrop'), {interval: seconds * 1000});
   show.load().then(function () { show.start(); });
-  window.SbcLivingRoom.mount(document.getElementById('overlay'), {label: document.body.getAttribute('data-label') || ''});
+  window.SbcLivingRoom.mount(document.getElementById('overlay'), {label: document.body.getAttribute('data-label') || '', name: document.body.getAttribute('data-name') || ''});
 })();

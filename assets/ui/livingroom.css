@@ -7,8 +7,7 @@
               radial-gradient(70% 55% at 50% 120%, rgba(232,112,42,.10), transparent 66%),
               radial-gradient(ellipse at 0% 100%, rgba(0,0,0,.50), rgba(0,0,0,.22) 42%, transparent 70%),
               radial-gradient(ellipse at 100% 100%, rgba(0,0,0,.42), transparent 60%); }
-.lr-greet { position: absolute; top: clamp(18px, 4vh, 48px); left: 50%; transform: translateX(-50%);
-  font-size: clamp(13px, 1.2vw, 19px); font-weight: 500; letter-spacing: .06em; opacity: .82; white-space: nowrap; }
+.lr-greet { margin-bottom: clamp(4px, 1vh, 12px); font-size: clamp(22px, 2.4vw, 42px); font-weight: 400; letter-spacing: .01em; opacity: .95; }
 .lr-clock { position: absolute; left: clamp(20px, 4vw, 72px); bottom: clamp(22px, 6vh, 72px); }
 .lr-time { font-size: clamp(56px, 8.5vw, 150px); font-weight: 250; letter-spacing: -.025em; line-height: .95; font-variant-numeric: tabular-nums; }
 .lr-date { margin-top: 12px; font-size: clamp(15px, 1.6vw, 26px); opacity: .92; }
@@ -16,6 +15,10 @@
 .lr-quote { position: absolute; right: clamp(20px, 4vw, 72px); bottom: clamp(26px, 6.5vh, 78px); width: min(42vw, 620px); margin: 0;
   text-align: right; transition: opacity 1.2s ease; }
 .lr-quote.fade { opacity: 0; }
+.lr-orig { margin: 0 0 8px; font-family: "SBC World", "Noto Sans", sans-serif;
+  font-size: clamp(19px, 2.1vw, 36px); line-height: 1.35; font-weight: 450; unicode-bidi: plaintext; }
+.lr-orig[dir="rtl"] { font-size: clamp(21px, 2.3vw, 40px); }
+.lr-quote blockquote.translation { font-size: clamp(13px, 1.25vw, 21px); opacity: .88; }
 .lr-quote blockquote { margin: 0; font-size: clamp(15px, 1.55vw, 27px); line-height: 1.38; font-weight: 400; font-style: italic; }
 .lr-quote figcaption { margin-top: 10px; font-size: clamp(11px, .95vw, 15px); opacity: .72; letter-spacing: .03em; }
 @media (max-width: 760px) {
