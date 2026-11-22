@@ -1161,6 +1161,13 @@ class Handler(BaseHTTPRequestHandler):
             result = agent_request({'action': 'vpn_library'}, timeout=10)
             self.send_json(200 if result.get('ok') else 503, result)
             return
+        if path == '/api/packet-history':
+            auth = self.require_session()
+            if not auth:
+                return
+            result = agent_request({'action': 'history_status'}, timeout=12)
+            self.send_json(200 if result.get('ok') else 503, result)
+            return
         if path == '/api/vpn/job':
             auth = self.require_session()
             if not auth:

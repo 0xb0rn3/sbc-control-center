@@ -45,6 +45,7 @@ import network_discovery
 import terminal_pty
 import sbc_site
 import vpn_library
+import packet_history
 
 BASE = sbc_site.ETC_DIR
 STATE = sbc_site.STATE_DIR
@@ -73,6 +74,7 @@ SERVICE_LABELS = {
     sbc_site.AGENT_UNIT: 'Control Center privileged agent',
     sbc_site.WEB_UNIT: 'Control Center web portal',
     'adguardhome': 'DNS filtering service',
+    packet_history.UNIT: '24-hour packet history recorder',
 }
 
 # The web portal cannot send arbitrary unit names or command arguments.
@@ -83,12 +85,13 @@ CONTROL_SERVICES = {
     'apguard': {'start', 'restart', 'enable'},
     'ap-iface': {'start', 'restart', 'enable'},
     'ap2-iface': {'start', 'restart', 'enable'},
+    packet_history.UNIT: {'start', 'stop', 'restart', 'enable', 'disable'},
 }
 
 LOG_SERVICES = {
     'hostapd', 'hostapd-2g', 'dnsmasq', 'apguard', 'ap-iface', 'ap2-iface',
     'systemd-networkd',
-    sbc_site.AGENT_UNIT, sbc_site.WEB_UNIT, 'adguardhome',
+    sbc_site.AGENT_UNIT, sbc_site.WEB_UNIT, 'adguardhome', packet_history.UNIT,
 }
 
 job_lock = threading.RLock()
@@ -1407,6 +1410,11 @@ def do_action(req: dict[str, Any], trusted_root_peer: bool = False) -> dict[str,
     if action == 'telemetry':
         with telemetry_lock:
             return {'ok': True, 'telemetry': telemetry.snapshot()}
+    if action == 'history_status':
+        try:
+            return packet_history.status()
+        except Exception as exc:
+            return {'ok': False, 'error': f'Packet history unavailable: {exc}'}
     if action in {'vpn_library', 'vpn_job', 'vpn_refresh', 'vpn_latency', 'vpn_switch', 'vpn_random', 'vpn_rotation', 'vpn_import'}:
         return vpn_action(action, req)
     if action == 'terminal_start':

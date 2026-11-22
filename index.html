@@ -393,6 +393,11 @@ pre { max-height: 430px; margin: 0; padding: 12px; overflow: auto; border: 1px s
 @media(max-width:720px){.evidence-grid{grid-template-columns:1fr}.threat-timeline{gap:2px;min-height:86px}.threat-map-svg{min-height:170px}.map-empty{font-size:10px}}
 
 
+.history-metrics { margin: 12px 0; }
+.history-metrics > div { padding: 2px 0; }
+.history-table { max-height: 420px; }
+.history-table tr.unknown td:first-child { color: #edaaaa; }
+.history-table td small { display: block; color: var(--dim); }
 /* VPN servers */
 .vpn-layout { grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); }
 .vpn-small { font-size: 15px; overflow-wrap: anywhere; }
@@ -578,6 +583,17 @@ pre { max-height: 430px; margin: 0; padding: 12px; overflow: auto; border: 1px s
             <div><h4>TLS server names</h4><div class="tablewrap"><table class="compact"><thead><tr><th>Visible SNI</th><th>Count</th></tr></thead><tbody id="packetTlsTable"><tr><td colspan="2" class="empty">No analysis yet.</td></tr></tbody></table></div></div>
           </div>
           <h4 style="margin-top:14px">Expert diagnostics</h4><div class="tablewrap"><table class="compact"><thead><tr><th>Severity / diagnostic</th><th>Count</th></tr></thead><tbody id="packetExpertTable"><tr><td colspan="2" class="empty">No analysis yet.</td></tr></tbody></table></div>
+        </div>
+        <div class="card" style="margin-top:12px" id="historyCard">
+          <div class="cardhead"><div><h3>24-hour packet history</h3><p class="sub">Always recording packet headers (addresses, ports, timing; no content) from both access points and the uplink. Hour files on a ring: the oldest goes first, and the disk use is capped.</p></div><span class="pill" id="historyState">—</span></div>
+          <div class="grid metrics history-metrics">
+            <div><div class="metric-label">Covers</div><div class="metric-value" id="historyCoverage">—</div><div class="metric-note" id="historyRange">—</div></div>
+            <div><div class="metric-label">Disk</div><div class="metric-value" id="historyDisk">—</div><div class="metric-note" id="historyBudget">—</div></div>
+            <div><div class="metric-label">Devices seen</div><div class="metric-value" id="historyHosts">—</div><div class="metric-note" id="historySummarised">—</div></div>
+            <div><div class="metric-label">Unrecognised</div><div class="metric-value" id="historyUnknown">—</div><div class="metric-note">Not a lease, a labelled device, this board or the router</div></div>
+          </div>
+          <div class="tablewrap history-table"><table class="compact"><thead><tr><th>Device</th><th>Addresses</th><th>Seen</th><th>Traffic</th><th>Where</th></tr></thead><tbody id="historyRows"><tr><td colspan="5">Loading…</td></tr></tbody></table></div>
+          <p class="footnote">Each hour is summarised within 15 minutes of closing. A device marked unrecognised was seen on the network without being one you know: label it in Network & Wi-Fi if it is yours. The recorder starts and stops from Services; the hour files stay root-only on this server.</p>
         </div>
       </section>
 
@@ -1664,6 +1680,20 @@ if(window.SbcSlideshow){
   slideshow.load().then(count=>{$('wallpaperCount').textContent=count>1?`${count} wallpapers in the slideshow.`:'No wallpapers on this server yet: the built-in background is shown.';applyDisplaySettings();if(displaySettings().bg!=='on')slideshow.next();});
 }
 initDisplayControls();
+
+// ---- 24-hour packet history
+function historyAgo(ts){return ts?vpnAgo(ts):'—';}
+async function refreshHistory(showErrors=false){
+  let d;try{d=await api('/api/packet-history');}catch(error){if(showErrors)showToast(error.message,true);$('historyState').textContent='Unavailable';$('historyState').className='pill bad';return;}
+  $('historyState').textContent=d.recording?'Recording':'Stopped';$('historyState').className='pill '+(d.recording?'ok':'bad');
+  const span=d.oldest&&d.newest?d.newest-d.oldest:0;
+  $('historyCoverage').textContent=span?`${Math.floor(span/3600)} h ${Math.round(span%3600/60)} min`:'starting';
+  $('historyRange').textContent=d.oldest?`since ${new Date(d.oldest*1000).toLocaleString()}`:'The first hour is being recorded';
+  $('historyDisk').textContent=fmtBytes(d.bytes||0);$('historyBudget').textContent=`of ${fmtBytes(d.budget_bytes)} · ${d.files.length}/${d.files_kept} hour files`;
+  $('historyHosts').textContent=String(d.hosts.length);$('historySummarised').textContent=`${d.summarised_hours} summarised hour(s) · ${d.interfaces.join(', ')}`;
+  $('historyUnknown').textContent=String(d.unrecognised);
+  $('historyRows').innerHTML=d.hosts.filter(h=>!h.multicast).map(h=>`<tr class="${h.unrecognised?'unknown':''}"><td class="mono">${vpnEsc(h.mac)}<small>${h.unrecognised?'Unrecognised':vpnEsc(h.known||'')}</small></td><td class="mono">${vpnEsc(h.ips.join(', ')||'—')}</td><td>${historyAgo(h.last)}<small>first ${historyAgo(h.first)}</small></td><td>${fmtBytes(h.bytes)}<small>${h.packets.toLocaleString()} packets</small></td><td>${vpnEsc(h.ifaces.join(', '))}</td></tr>`).join('')||'<tr><td colspan="5">No hour has been summarised yet. The first summary arrives within 15 minutes after the first full hour.</td></tr>';
+}
 function fmtRate(bytes){return `${fmtBytes(bytes)}/s`;}
 function drawLineChart(canvasId,series,maximum=null){
   const canvas=$(canvasId);if(!canvas)return;const rect=canvas.getBoundingClientRect();if(rect.width<20)return;
@@ -1813,7 +1843,7 @@ function navigate(target){
   if(navCenterDialog.open)navCenterDialog.close();
   const reduceMotion=window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   el.scrollIntoView({behavior:reduceMotion?'auto':'smooth',block:'start'});
-  if(target==='packet-inspector'){refreshPacketInspector(false);refreshPacketTools();}
+  if(target==='packet-inspector'){refreshPacketInspector(false);refreshPacketTools();refreshHistory(false);}
   if(target==='vpn'){refreshVpn(false);api('/api/vpn/job').then(r=>{renderVpnJob(r.job);if(r.job&&r.job.state==='running')followVpnJob();}).catch(()=>{});}
 }
 document.querySelectorAll('.navbtn[data-target],.nav-center-item').forEach(button=>button.addEventListener('click',()=>navigate(button.dataset.target)));
