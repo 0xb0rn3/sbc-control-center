@@ -638,7 +638,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return False
 
-    def read_json(self) -> dict[str, Any]:
+    def read_json(self, max_body: int = MAX_BODY) -> dict[str, Any]:
         content_type = self.headers.get('Content-Type', '').split(';', 1)[0].strip().lower()
         if content_type != 'application/json':
             raise ValueError('Content-Type must be application/json.')
@@ -648,7 +648,7 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get('Content-Length', ''))
         except ValueError:
             raise ValueError('A valid Content-Length is required.')
-        if length < 2 or length > MAX_BODY:
+        if length < 2 or length > max_body:
             raise ValueError('Request body size is invalid.')
         raw = self.rfile.read(length)
         if len(raw) != length:
@@ -1117,6 +1117,19 @@ class Handler(BaseHTTPRequestHandler):
             result = agent_request({'action': 'telemetry'}, timeout=5)
             self.send_json(200 if result.get('ok') else 503, result)
             return
+        if path == '/api/vpn':
+            auth = self.require_session()
+            if not auth:
+                return
+            result = agent_request({'action': 'vpn_library'}, timeout=10)
+            self.send_json(200 if result.get('ok') else 503, result)
+            return
+        if path == '/api/vpn/job':
+            auth = self.require_session()
+            if not auth:
+                return
+            self.send_json(200, agent_request({'action': 'vpn_job'}, timeout=5))
+            return
         if path == '/api/dns-filter':
             auth = self.require_session()
             if not auth:
@@ -1225,6 +1238,9 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         if not self.same_origin_request():
             self.send_json(403, {'ok': False, 'error': 'Cross-origin request rejected.'})
+            return
+        if path == '/api/vpn/import':
+            self.handle_vpn_import()
             return
         try:
             data = self.read_json()
@@ -1596,6 +1612,11 @@ class Handler(BaseHTTPRequestHandler):
                 payload = {'action': 'device_scan', 'interfaces': data.get('interfaces')}
             elif action == 'device_fingerprint':
                 payload = {'action': 'device_fingerprint', 'ip': data.get('ip')}
+            elif action in {'vpn_refresh', 'vpn_latency', 'vpn_switch', 'vpn_random', 'vpn_rotation'}:
+                payload = {'action': action}
+                for key in ('country', 'hostname', 'countries', 'enabled', 'hours'):
+                    if key in data:
+                        payload[key] = data[key]
             else:
                 self.send_json(400, {'ok': False, 'error': 'Unsupported action.'})
                 return
@@ -1606,6 +1627,42 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, agent_request(payload, timeout=50))
             return
         self.send_json(404, {'ok': False, 'error': 'Not found.'})
+
+    def handle_vpn_import(self) -> None:
+        """Mullvad config upload (.zip or .conf, base64 in JSON): stored briefly in the portal's own
+        state folder for the root agent to read, then removed whatever the outcome."""
+        auth = self.require_session()
+        if not auth:
+            return
+        sid, item = auth
+        if not self.verify_csrf(item):
+            self.send_json(403, {'ok': False, 'error': 'CSRF validation failed.'})
+            return
+        try:
+            data = self.read_json(max_body=3 * 1024 * 1024)
+            raw = base64.b64decode(str(data.get('data_b64', '')), validate=True)
+        except Exception as exc:
+            self.send_json(400, {'ok': False, 'error': f'Upload rejected: {exc}'})
+            return
+        if not 1 <= len(raw) <= 2 * 1024 * 1024:
+            self.send_json(400, {'ok': False, 'error': 'The file must be between 1 byte and 2 MB.'})
+            return
+        name = f'vpn-upload-{secrets.token_hex(16)}.bin'
+        path = sbc_site.WEB_STATE_DIR / name
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            with os.fdopen(fd, 'wb') as handle:
+                handle.write(raw)
+            payload = {'action': 'vpn_import', 'session_id': sid, 'upload': name,
+                       'filename': str(data.get('filename', 'upload.conf'))[:120]}
+            if isinstance(data.get('privilege_token'), str):
+                payload['privilege_token'] = data['privilege_token']
+            self.send_json(200, agent_request(payload, timeout=40))
+        finally:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
 
     def do_HEAD(self) -> None:
         if not local_host_header_allowed(self.headers.get('Host', '')):

@@ -23,6 +23,7 @@ import tempfile
 import grp
 import ipaddress
 import shlex
+import stat
 import struct
 import pwd
 import ssl
@@ -43,6 +44,7 @@ import device_intelligence
 import network_discovery
 import terminal_pty
 import sbc_site
+import vpn_library
 
 BASE = sbc_site.ETC_DIR
 STATE = sbc_site.STATE_DIR
@@ -117,6 +119,7 @@ PRIVILEGED_ACTIONS = {
     'terminal_start', 'service', 'update_job', 'wifi_config', 'backup_create', 'reboot', 'poweroff',
     'portal_update_source', 'logs', 'backup_download', 'dns_profile', 'packet_start', 'device_label', 'device_unlabel',
     'device_scan', 'device_fingerprint', 'packet_analysis',
+    'vpn_switch', 'vpn_random', 'vpn_rotation', 'vpn_import',
 }
 
 
@@ -185,8 +188,22 @@ def privilege_scope(intent: Any) -> dict[str, Any] | None:
     action = intent.get('action')
     if not isinstance(action, str):
         return None
-    if action in {'reboot', 'poweroff', 'backup_create', 'terminal_start'}:
+    if action in {'reboot', 'poweroff', 'backup_create', 'terminal_start', 'vpn_import'}:
         return {'action': action}
+    if action == 'vpn_switch':
+        host = intent.get('hostname')
+        return {'action': action, 'hostname': host} if isinstance(host, str) and re.fullmatch(r'[a-z0-9-]{3,40}', host) else None
+    if action in {'vpn_random', 'vpn_rotation'}:
+        countries = intent.get('countries', [])
+        if not isinstance(countries, list) or len(countries) > 60 or any(not isinstance(c, str) or not re.fullmatch(r'[a-z]{2}', c) for c in countries):
+            return None
+        scope = {'action': action, 'countries': sorted(set(countries))}
+        if action == 'vpn_rotation':
+            enabled, hours = intent.get('enabled'), intent.get('hours')
+            if not isinstance(enabled, bool) or hours not in vpn_library.ROTATION_HOURS:
+                return None
+            scope.update({'enabled': enabled, 'hours': hours})
+        return scope
     if action == 'packet_start':
         return _valid_packet_capture_scope(intent)
     if action == 'packet_analysis':
@@ -1318,6 +1335,63 @@ def start_job(kind: str) -> dict[str, Any]:
         return {'ok': True, 'job': dict(job)}
 
 
+VPN_UPLOAD = re.compile(r'vpn-upload-[0-9a-f]{32}\.bin')
+
+
+def _read_vpn_upload(name: Any) -> bytes:
+    """The portal stores an upload in its own state folder and passes only the file name."""
+    if not isinstance(name, str) or not VPN_UPLOAD.fullmatch(name):
+        raise vpn_library.VpnError('Invalid upload reference.')
+    fd = os.open(sbc_site.WEB_STATE_DIR / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > vpn_library.MAX_UPLOAD_BYTES:
+            raise vpn_library.VpnError('The upload is not a regular file of at most 2 MB.')
+        with os.fdopen(fd, 'rb', closefd=False) as handle:
+            return handle.read(vpn_library.MAX_UPLOAD_BYTES + 1)
+    finally:
+        os.close(fd)
+
+
+def vpn_action(action: str, req: dict[str, Any]) -> dict[str, Any]:
+    try:
+        if action == 'vpn_library':
+            return vpn_library.library()
+        if action == 'vpn_refresh':
+            return vpn_library.refresh_relays()
+        if action == 'vpn_latency':
+            country = req.get('country')
+            if country is not None and not (isinstance(country, str) and re.fullmatch(r'[a-z]{2}', country)):
+                return {'ok': False, 'error': 'Invalid country.'}
+            return vpn_library.measure_latency(country)
+        if action == 'vpn_job':
+            return vpn_library.job_status()
+        if action == 'vpn_switch':
+            return vpn_library.start_switch_job('manual', vpn_library.switch, req.get('hostname'))
+        if action == 'vpn_random':
+            return vpn_library.start_switch_job('random', vpn_library.switch_random, req.get('countries') or None)
+        if action == 'vpn_rotation':
+            return vpn_library.set_rotation(req.get('enabled'), req.get('hours'), req.get('countries', []))
+        if action == 'vpn_import':
+            filename = req.get('filename') if isinstance(req.get('filename'), str) else 'upload.conf'
+            return vpn_library.import_configs(_read_vpn_upload(req.get('upload')), filename[:120])
+    except (vpn_library.VpnError, OSError) as exc:
+        return {'ok': False, 'error': str(exc)}
+    return {'ok': False, 'error': 'Unknown VPN action.'}
+
+
+def vpn_rotation_scheduler() -> None:
+    time.sleep(30)
+    while True:
+        try:
+            result = vpn_library.rotation_tick()
+            if result is not None:
+                print(f"[VPN] rotation: {result.get('message') or result.get('error')}", flush=True)
+        except Exception as exc:
+            print(f'[VPN] rotation check failed: {exc}', flush=True)
+        time.sleep(60)
+
+
 def do_action(req: dict[str, Any], trusted_root_peer: bool = False) -> dict[str, Any]:
     action = req.get('action')
     if action == 'privilege_info':
@@ -1333,6 +1407,8 @@ def do_action(req: dict[str, Any], trusted_root_peer: bool = False) -> dict[str,
     if action == 'telemetry':
         with telemetry_lock:
             return {'ok': True, 'telemetry': telemetry.snapshot()}
+    if action in {'vpn_library', 'vpn_job', 'vpn_refresh', 'vpn_latency', 'vpn_switch', 'vpn_random', 'vpn_rotation', 'vpn_import'}:
+        return vpn_action(action, req)
     if action == 'terminal_start':
         owner = req.get('session_id')
         actor = configured_sudo_user() or 'administrator'
@@ -1584,6 +1660,7 @@ def main() -> None:
             except Exception as exc:
                 print(f'[TERMINAL] reaper-error type={type(exc).__name__}', flush=True)
     threading.Thread(target=terminal_reaper, daemon=True, name='terminal-reaper').start()
+    threading.Thread(target=vpn_rotation_scheduler, daemon=True, name='vpn-rotation').start()
     SOCKET_DIR.mkdir(mode=0o750, parents=True, exist_ok=True)
     try:
         SOCKET_PATH.unlink()
