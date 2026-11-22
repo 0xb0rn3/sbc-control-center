@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>Standby · __SBC_DEVICE_LABEL__</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #08090c; overflow: hidden; cursor: none;
+    font-family: "Hanken Grotesk", "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .sbc-backdrop { position: fixed; inset: 0; background: #08090c; }
+  .sbc-slide { position: absolute; inset: 0; background: #08090c center 34% / cover no-repeat; opacity: 0; transition: opacity 1.4s ease; }
+  .sbc-slide.on { opacity: 1; }
+  .clock { position: fixed; left: clamp(20px, 4vw, 64px); bottom: clamp(20px, 5vh, 64px); color: #fff;
+    text-shadow: 0 2px 18px rgba(0,0,0,.55), 0 1px 2px rgba(0,0,0,.6); }
+  .clock::before { content: ''; position: fixed; left: 0; bottom: 0; width: min(100vw, 900px); height: min(70vh, 520px); z-index: -1; background: radial-gradient(ellipse at 0% 100%, rgba(0,0,0,.55), rgba(0,0,0,.25) 45%, transparent 72%); }
+  .time { font-size: clamp(54px, 8vw, 132px); font-weight: 300; letter-spacing: -.02em; line-height: 1; font-variant-numeric: tabular-nums; }
+  .date { margin-top: 10px; font-size: clamp(15px, 1.6vw, 26px); opacity: .9; }
+  @media (prefers-reduced-motion: reduce) { .sbc-slide { transition: none; } }
+</style>
+<script src="/assets/ui/slideshow.js"></script>
+<script src="/assets/ui/standby.js" defer></script>
+</head>
+<body>
+<div id="backdrop" class="sbc-backdrop" aria-hidden="true"></div>
+<div class="clock"><div class="time" id="time">--:--</div><div class="date" id="date"></div></div>
+</body>
+</html>

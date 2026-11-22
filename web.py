@@ -67,7 +67,19 @@ ASSETS_DIR = sbc_site.APP_DIR / 'assets'
 # two folders, plain file names and known types are served; nothing outside them can be named.
 STATIC_TYPES = {'.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
                 '.jpg': 'image/jpeg', '.webp': 'image/webp', '.png': 'image/png', '.json': 'application/json'}
-STATIC_PATH = re.compile(r'/assets/(vendor|wallpapers)/([A-Za-z0-9][A-Za-z0-9_.-]{0,120})')
+STATIC_PATH = re.compile(r'/assets/(vendor|ui|wallpapers)/([A-Za-z0-9][A-Za-z0-9_.-]{0,120})')
+STANDBY_PATH = sbc_site.APP_DIR / 'standby.html'
+WALLPAPER_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,120}\.(?:jpe?g|webp|png)')
+
+
+def wallpaper_index() -> bytes:
+    """The slideshow's picture list, read from the wallpaper folder as it is now."""
+    try:
+        names = sorted(entry.name for entry in os.scandir(ASSETS_DIR / 'wallpapers')
+                       if entry.is_file(follow_symlinks=False) and WALLPAPER_NAME.fullmatch(entry.name))
+    except OSError:
+        names = []
+    return json.dumps({'images': names[:5000]}, separators=(',', ':')).encode()
 STATIC_MAX_BYTES = 8 * 1024 * 1024
 
 
@@ -1021,7 +1033,32 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        if path.startswith('/assets/vendor/') or path.startswith('/assets/wallpapers/'):
+        if path == '/assets/wallpapers/index.json':
+            body = wallpaper_index()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.security_headers(cache='public, max-age=300')
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path == '/standby':
+            try:
+                body = STANDBY_PATH.read_bytes()
+            except OSError:
+                self.send_error(404, 'Standby page not installed')
+                return
+            for token, value in PAGE_TOKENS:
+                body = body.replace(token, value)
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            # its own nonce: the page has no inline script, the CSP only has to allow same-origin files
+            self.security_headers(secrets.token_urlsafe(18))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path.startswith('/assets/vendor/') or path.startswith('/assets/ui/') or path.startswith('/assets/wallpapers/'):
             asset = read_static_asset(path)
             if asset is None:
                 self.send_error(404, 'Asset not found')
