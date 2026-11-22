@@ -272,12 +272,18 @@ def status() -> dict[str, Any]:
             agg['packets'] += h['packets']; agg['bytes'] += h['bytes']; agg['hours'] += 1
             agg['ips'].update(h.get('ips', [])); agg['ifaces'].update(h.get('ifaces', []))
     known = _known_macs()
+    ap_ifaces = set(sbc_site.ap_interfaces(SITE))
     rows = []
     for mac, h in hosts.items():
         multicast = int(mac.split(':')[0], 16) & 1
+        on_ap = bool(h['ifaces'] & ap_ifaces)
+        label = known.get(mac)
+        if label is None and not on_ap:
+            # seen only on the uplink cable: a device of the home router's own network, not of these access points
+            label = 'home router network'
         rows.append({**h, 'ips': sorted(h['ips'])[:8], 'ifaces': sorted(h['ifaces']),
-                     'known': known.get(mac), 'multicast': bool(multicast),
-                     'unrecognised': not multicast and mac not in known})
+                     'known': label, 'multicast': bool(multicast), 'on_access_point': on_ap,
+                     'unrecognised': not multicast and on_ap and mac not in known})
     rows.sort(key=lambda r: (not r['unrecognised'], -r['last']))
     total = sum(f['bytes'] for f in files)
     return {

@@ -63,10 +63,22 @@ class PacketHistoryTests(unittest.TestCase):
         a, b, c = '02:00:00:00:00:01', '02:00:00:00:00:02', '02:11:22:33:44:55'
         frames = [frame(a, b, '192.168.60.20', '1.1.1.1'), frame(b, a, '1.1.1.1', '192.168.60.20'),
                   frame(c, 'ff:ff:ff:ff:ff:ff', '192.168.60.99', '192.168.60.255')]
+        # pcap files carry no interface names: treat every host as seen on an access point
+        ap = ph.sbc_site.ap_interfaces(ph.SITE)[0]
         write_pcap(self.tmp / 'ring' / 'ring_00001_20261122100000.pcapng', frames, start)
         (self.tmp / 'ring' / 'ring_00002_20261122110000.pcapng').write_bytes(b'')
         self.assertEqual(ph.summarize(), 1)
         self.assertEqual(ph.summarize(), 0)   # summarised once
+        real_summarize = ph.summarize_file
+        def with_iface(path):
+            s = real_summarize(path)
+            for h in s['hosts'].values():
+                h['ifaces'] = [ap]
+            return s
+        for f in (ph.SUMMARY_DIR).glob('*.json'):
+            f.unlink()
+        with mock.patch.object(ph, 'summarize_file', side_effect=with_iface):
+            ph.summarize()
         with mock.patch.object(ph, '_known_macs', return_value={a: 'phone', b: 'uplink router'}), \
              mock.patch('subprocess.run', return_value=mock.Mock(returncode=0)):
             status = ph.status()
