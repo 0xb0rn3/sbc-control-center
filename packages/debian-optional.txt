@@ -1,0 +1,4 @@
+# Optional components (install with tools/install-dependencies.sh --all):
+# intrusion detection on the access points (about 600 MB of memory with the ET Open rules)
+suricata
+suricata-update

@@ -1,0 +1,33 @@
+# Debian 13 (trixie) / Armbian packages every Control Center install needs.
+# tools/install-dependencies.sh installs this list (and debian-optional.txt with --all).
+# portal and agent
+python3
+python3-fido2
+python3-yaml
+python3-maxminddb
+python3-geoip2
+openssl
+sudo
+libpam0g
+# access points, DHCP, firewall, VPN
+hostapd
+dnsmasq
+iw
+nftables
+iproute2
+wireguard-tools
+procps
+util-linux
+curl
+rsync
+# connections, packet capture and analysis
+conntrack
+tshark
+tcpdump
+# device discovery and identification
+arp-scan
+nmap
+p0f
+arpwatch
+ieee-data
+avahi-utils

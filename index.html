@@ -1744,7 +1744,7 @@ async function refreshLiveMap(){
   $('threatMapStatus').textContent=`${conns.length} live destination(s) · ${matches.length} feed match(es) · ${(d.global||[]).length} global threat point(s) · updated ${new Date(d.generated*1000).toLocaleTimeString()}`;
   $('liveConnRows').innerHTML=conns.slice(0,60).map(c=>`<tr class="${c.feeds.length?'hit':''}"><td class="mono">${vpnEsc(c.ip)}${c.feeds.length?`<small> · ${vpnEsc(c.feeds.join(', '))}</small>`:''}</td><td>${c.geo?`${vpnFlag(c.geo.cc)} ${vpnEsc(c.geo.city||c.geo.country)}`:'—'}</td><td>${vpnEsc(c.clients.join(', '))}</td><td class="mono">${vpnEsc(c.ports.join(', '))}</td></tr>`).join('')||'<tr><td colspan="4">No device is connected to the internet right now.</td></tr>';
   $('liveFeedRows').innerHTML=Object.entries(d.feeds||{}).map(([k,f])=>`<tr><td>${vpnEsc(f.label)}</td><td>${(f.entries||0).toLocaleString()}</td><td>${f.fetched?vpnAgo(f.fetched):'not yet'}</td></tr>`).join('');
-  $('liveMapFeeds').textContent='Local GeoIP · feeds fetched through the VPN tunnel';
+  $('liveMapFeeds').innerHTML='Feeds fetched through the VPN tunnel · <a href="https://db-ip.com" target="_blank" rel="noopener noreferrer">IP Geolocation by DB-IP</a> (CC BY 4.0)';
 }
 function startLiveMap(){clearInterval(liveMapTimer);refreshLiveMap();liveMapTimer=setInterval(()=>{if(document.visibilityState!=='hidden'&&currentSection==='security-operations'&&!standbyActive)refreshLiveMap();},5000);}
 ['liveShowConns','liveShowGlobal','liveShowIds'].forEach(id=>$(id).addEventListener('change',refreshLiveMap));
