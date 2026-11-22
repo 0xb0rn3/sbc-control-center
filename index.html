@@ -724,6 +724,15 @@ pre { max-height: 430px; margin: 0; padding: 12px; overflow: auto; border: 1px s
             <div class="btnrow" style="margin-top:12px"><button class="btn primary" id="vpnRotationSave" type="button">Save rotation</button><span class="footnote" id="vpnRotationResult" style="margin:0"></span></div>
           </div>
         </div>
+        <div class="card" style="margin-top:12px" id="devrouteCard">
+          <div class="cardhead"><div><h3>Per-device routing</h3><p class="sub">Choose how each Wi-Fi device reaches the internet. Devices are matched by hardware address, so the choice follows them across address changes. A device on the second tunnel is cut off, never leaked, if that tunnel drops.</p></div><span class="pill" id="secondState">Second tunnel off</span></div>
+          <div class="fieldgrid vpn-country-row">
+            <div class="field"><label for="secondServer">Second tunnel server</label><select id="secondServer" class="select"><option value="">Off</option></select></div>
+            <div class="field field-actions"><label>&nbsp;</label><button class="btn primary" id="secondApply" type="button">Apply</button></div>
+          </div>
+          <div class="tablewrap"><table class="compact"><thead><tr><th>Device</th><th>Address</th><th>Route</th></tr></thead><tbody id="devrouteRows"><tr><td colspan="3">Loading…</td></tr></tbody></table></div>
+          <p class="footnote">Main tunnel: the server above. Second tunnel: its own server, for devices that should appear in another country. Direct: through your internet provider without the VPN (for apps that refuse VPN addresses); DNS stays filtered and private. Blocked: no internet.</p>
+        </div>
         <div class="grid two" style="margin-top:12px">
           <div class="card">
             <div class="cardhead"><div><h3>Server list</h3><p class="sub" id="vpnListUpdated">—</p></div></div>
@@ -1174,7 +1183,7 @@ $('privilegeCancelBtn').addEventListener('click',()=>closePrivilegeDialog(null))
 $('privilegeDialog').addEventListener('cancel',event=>{event.preventDefault();closePrivilegeDialog(null);});
 $('privilegeDialog').addEventListener('close',()=>{if(privilegeResolver)closePrivilegeDialog(null);});
 async function executeAdminAction(data,summary='This operation needs administrator privileges.'){
-  const privilegeRequired=['vpn_switch','vpn_random','vpn_rotation','service','update_job','wifi_config','backup_create','reboot','poweroff','portal_update_source','logs','backup_download','dns_profile','packet_start','packet_analysis','device_label','device_unlabel','device_scan','device_fingerprint'].includes(data.action)
+  const privilegeRequired=['devroute_set','vpn_second','vpn_switch','vpn_random','vpn_rotation','service','update_job','wifi_config','backup_create','reboot','poweroff','portal_update_source','logs','backup_download','dns_profile','packet_start','packet_analysis','device_label','device_unlabel','device_scan','device_fingerprint'].includes(data.action)
     || (data.action==='console'&&(['status','nft','journalctl','wg'].includes(String(data.command||'').trim().split(/\s+/)[0])||String(data.command||'').trim()==='ss -lntup'||/^systemctl\s+status\s+/.test(String(data.command||'').trim())||/^dns\s+profile\s+(standard|aggressive|tv)$/.test(String(data.command||'').trim())));
   if(!privilegeRequired)return api('/api/action',{method:'POST',body:JSON.stringify(data)});
   if(!configuredSudoUser)throw new Error('No sudo account is configured on the server. Re-run installation with SUDO_AUTH_USER set.');
@@ -1555,7 +1564,20 @@ function vpnAgo(ts){if(!ts)return 'never';const s=Math.max(0,Math.round(Date.now
 function vpnEsc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 async function refreshVpn(showErrors=true){
   try{vpnData=await api('/api/vpn');renderVpn();}catch(error){if(showErrors)showToast(error.message,true);}
+  refreshDevroute();
 }
+const ROUTE_LABELS={main:'Main tunnel',second:'Second tunnel',direct:'Direct (no VPN)',blocked:'Blocked'};
+async function refreshDevroute(){
+  let d;try{d=await api('/api/devroute');}catch(e){return;}
+  const s=d.second||{};$('secondState').textContent=s.up?`Second tunnel: ${s.server||'up'}`:'Second tunnel off';$('secondState').className='pill '+(s.up?'ok':'');
+  const sel=$('secondServer');if(vpnData&&sel.options.length<2){sel.innerHTML='<option value="">Off</option>'+vpnData.countries.map(c=>`<optgroup label="${vpnEsc(c.name)}">${c.servers.map(v=>`<option value="${vpnEsc(v.hostname)}">${vpnFlag(c.code)} ${vpnEsc(v.hostname)} · ${vpnEsc(v.city)}</option>`).join('')}</optgroup>`).join('');}
+  sel.value=s.up?(s.server||''):'';
+  $('devrouteRows').innerHTML=(d.devices||[]).map(x=>`<tr><td>${vpnEsc(x.name||'Unnamed device')}<small class="mono"> ${vpnEsc(x.mac)}</small></td><td class="mono">${vpnEsc(x.ip||'—')}</td><td><select class="select devroute-select" data-mac="${vpnEsc(x.mac)}">${Object.entries(ROUTE_LABELS).map(([k,v])=>`<option value="${k}"${x.route===k?' selected':''}${k==='second'&&!s.up?' disabled':''}>${v}</option>`).join('')}</select></td></tr>`).join('')||'<tr><td colspan="3">No devices have joined the Wi-Fi yet.</td></tr>';
+}
+$('devrouteRows').addEventListener('change',event=>{const el=event.target.closest('.devroute-select');if(!el)return;
+  vpnRun({action:'devroute_set',mac:el.dataset.mac,route:el.value},`Route ${el.dataset.mac} via: ${ROUTE_LABELS[el.value]}. The firewall is checked before it changes.`,el).then(refreshDevroute);});
+$('secondApply').addEventListener('click',event=>{const host=$('secondServer').value;
+  vpnRun({action:'vpn_second',hostname:host},host?`Start the second tunnel through ${host}.`:'Stop the second tunnel. Devices routed to it lose internet until it is back.',event.currentTarget).then(refreshDevroute);});
 function renderVpn(){
   const d=vpnData;if(!d)return;
   const a=d.active||{},ex=d.exit,srv=a.server;

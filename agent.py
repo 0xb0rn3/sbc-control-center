@@ -47,6 +47,7 @@ import sbc_site
 import vpn_library
 import packet_history
 import threat_map
+import devroute
 
 BASE = sbc_site.ETC_DIR
 STATE = sbc_site.STATE_DIR
@@ -125,7 +126,7 @@ PRIVILEGED_ACTIONS = {
     'terminal_start', 'service', 'update_job', 'wifi_config', 'backup_create', 'reboot', 'poweroff',
     'portal_update_source', 'logs', 'backup_download', 'dns_profile', 'packet_start', 'device_label', 'device_unlabel',
     'device_scan', 'device_fingerprint', 'packet_analysis',
-    'vpn_switch', 'vpn_random', 'vpn_rotation', 'vpn_import',
+    'vpn_switch', 'vpn_random', 'vpn_rotation', 'vpn_import', 'devroute_set', 'vpn_second',
 }
 
 
@@ -199,6 +200,14 @@ def privilege_scope(intent: Any) -> dict[str, Any] | None:
     if action == 'vpn_switch':
         host = intent.get('hostname')
         return {'action': action, 'hostname': host} if isinstance(host, str) and re.fullmatch(r'[a-z0-9-]{3,40}', host) else None
+    if action == 'devroute_set':
+        mac, route = str(intent.get('mac', '')).lower(), intent.get('route')
+        if not re.fullmatch(r'(?:[0-9a-f]{2}:){5}[0-9a-f]{2}', mac) or route not in devroute.ROUTES:
+            return None
+        return {'action': action, 'mac': mac, 'route': route}
+    if action == 'vpn_second':
+        host = intent.get('hostname', '')
+        return {'action': action, 'hostname': host} if isinstance(host, str) and re.fullmatch(r'(|[a-z0-9-]{3,40})', host) else None
     if action in {'vpn_random', 'vpn_rotation'}:
         countries = intent.get('countries', [])
         if not isinstance(countries, list) or len(countries) > 60 or any(not isinstance(c, str) or not re.fullmatch(r'[a-z]{2}', c) for c in countries):
@@ -1413,6 +1422,21 @@ def do_action(req: dict[str, Any], trusted_root_peer: bool = False) -> dict[str,
     if action == 'telemetry':
         with telemetry_lock:
             return {'ok': True, 'telemetry': telemetry.snapshot()}
+    if action == 'devroute_status':
+        return devroute.status()
+    if action == 'devroute_set':
+        try:
+            return devroute.set_route(req.get('mac'), req.get('route'), str(req.get('label', ''))[:64])
+        except (devroute.RouteError, OSError) as exc:
+            return {'ok': False, 'error': str(exc)}
+    if action == 'vpn_second':
+        try:
+            host = req.get('hostname') or ''
+            result = vpn_library.second_up(host) if host else vpn_library.second_down()
+            state = devroute.load_state(); state['second_server'] = host or None; devroute.save_state(state)
+            return result
+        except (vpn_library.VpnError, OSError) as exc:
+            return {'ok': False, 'error': str(exc)}
     if action == 'threat_map':
         try:
             return threat_map.snapshot()

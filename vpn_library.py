@@ -676,3 +676,56 @@ def measure_latency(country: str | None = None) -> dict[str, Any]:
     reached = sorted((ms, host) for host, ms in results.items() if ms is not None)
     return {'ok': True, 'measured': len(results), 'reached': len(reached),
             'fastest': [{'hostname': h, 'latency_ms': ms} for ms, h in reached[:5]]}
+
+
+# ---------------------------------------------------------------- second tunnel (per-device routing)
+
+SECOND_IFACE = f'{IFACE}2'[:15]
+SECOND_CONF = WG_DIR / f'{SECOND_IFACE}.conf'
+SECOND_TABLE = 201
+
+
+def second_up(hostname: str) -> dict[str, Any]:
+    """A second tunnel to another server, for devices routed to it. Its default route lives only
+    in table 201 (with an unreachable fallback), so nothing else ever uses it."""
+    server = next((s for s in _load_servers()['servers'] if s.get('hostname') == hostname and s.get('active', True)), None)
+    if not server:
+        raise VpnError(f'{hostname} is not in the server library.')
+    live = parse_conf(_live_conf()[0])['interface']
+    private_key, address = live.get('privatekey', ''), live.get('address', '')
+    if server.get('key_id'):
+        keys = _read_json(KEYS_PATH, {})
+        entry = keys.get(server['key_id']) if isinstance(keys, dict) else None
+        if entry:
+            private_key, address = entry['private_key'], entry['address']
+    if not _KEY.fullmatch(private_key) or not _valid_addresses(address):
+        raise VpnError('No usable key for the second tunnel.')
+    ipv4 = ','.join(a for a in address.split(',') if ':' not in a)
+    text = (f"[Interface]\n# second tunnel for per-device routing ({hostname})\nPrivateKey = {private_key}\nAddress = {ipv4}\n"
+            f"Table = off\nPostUp = ip route replace default dev %i table {SECOND_TABLE}\n"
+            f"PreDown = ip route del default dev %i table {SECOND_TABLE}\n\n"
+            f"[Peer]\nPublicKey = {server['pubkey']}\nAllowedIPs = 0.0.0.0/0\nEndpoint = {server['ipv4']}:{server['port']}\n"
+            "PersistentKeepalive = 25\n")
+    _write_private(SECOND_CONF, text)
+    _log(f'Second tunnel: connecting to {hostname} ({server.get("city")}, {server.get("country")})')
+    code, out = _run([SYSTEMCTL, 'restart', f'wg-quick@{SECOND_IFACE}.service'], timeout=40)
+    if code != 0:
+        raise VpnError(f'The second tunnel did not start: {out.strip()[:300]}')
+    started = time.time()
+    deadline = started + 15
+    while time.time() < deadline:
+        _run([PING, '-n', '-c', '1', '-W', '2', '-I', SECOND_IFACE, PROBE_ADDRESS], timeout=4)
+        code, hs = _run([WG, 'show', SECOND_IFACE, 'latest-handshakes'], timeout=5)
+        parts = hs.split()
+        if code == 0 and len(parts) > 1 and parts[1].isdigit() and int(parts[1]) >= int(started) - 1:
+            _run([SYSTEMCTL, 'enable', f'wg-quick@{SECOND_IFACE}.service'], timeout=10)
+            _log(f'Second tunnel up through {hostname}', 'ok')
+            return {'ok': True, 'message': f'Second tunnel up through {hostname}.', 'hostname': hostname}
+        time.sleep(1)
+    second_down()
+    raise VpnError(f'{hostname} gave no handshake on the second tunnel within 15 s; it was taken down.')
+
+
+def second_down() -> dict[str, Any]:
+    _run([SYSTEMCTL, 'disable', '--now', f'wg-quick@{SECOND_IFACE}.service'], timeout=30)
+    return {'ok': True, 'message': 'Second tunnel stopped; devices routed to it are cut off until it is back.'}

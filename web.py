@@ -1176,6 +1176,13 @@ class Handler(BaseHTTPRequestHandler):
             result = agent_request({'action': 'history_status'}, timeout=12)
             self.send_json(200 if result.get('ok') else 503, result)
             return
+        if path == '/api/devroute':
+            auth = self.require_session()
+            if not auth:
+                return
+            result = agent_request({'action': 'devroute_status'}, timeout=8)
+            self.send_json(200 if result.get('ok') else 503, result)
+            return
         if path == '/api/vpn/job':
             auth = self.require_session()
             if not auth:
@@ -1664,9 +1671,9 @@ class Handler(BaseHTTPRequestHandler):
                 payload = {'action': 'device_scan', 'interfaces': data.get('interfaces')}
             elif action == 'device_fingerprint':
                 payload = {'action': 'device_fingerprint', 'ip': data.get('ip')}
-            elif action in {'vpn_refresh', 'vpn_latency', 'vpn_switch', 'vpn_random', 'vpn_rotation'}:
+            elif action in {'vpn_refresh', 'vpn_latency', 'vpn_switch', 'vpn_random', 'vpn_rotation', 'devroute_set', 'vpn_second'}:
                 payload = {'action': action}
-                for key in ('country', 'hostname', 'countries', 'enabled', 'hours'):
+                for key in ('country', 'hostname', 'countries', 'enabled', 'hours', 'mac', 'route', 'label'):
                     if key in data:
                         payload[key] = data[key]
             else:
