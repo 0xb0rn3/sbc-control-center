@@ -1,245 +1,314 @@
 #!/usr/bin/env python3
-"""Bounded offline TShark analysis for application-owned PCAPNG captures."""
+"""Bounded, on-demand TShark analysis for root-owned PCAPNG captures.
+
+The AF_PACKET monitor remains the low-overhead live collector. TShark performs
+an explicit, time- and packet-bounded second pass and returns protocol metadata,
+conversation summaries, one-second capture buckets and TCP diagnostics only.
+Raw packet payloads are never returned to the portal.
+"""
 from __future__ import annotations
 
 import collections
 import csv
+import datetime as dt
 import io
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
+
+import sbc_site
 from typing import Any
 
-CAPTURE_DIR = Path("/var/lib/sbc-control-center/captures")
+CAPTURE_DIR = sbc_site.STATE_DIR / 'captures'
 MAX_PCAP_BYTES = 32 * 1024 * 1024
 MAX_ANALYSED_PACKETS = 5000
-MAX_OUTPUT_BYTES = 2 * 1024 * 1024
-ANALYSIS_TIMEOUT_SECONDS = 20
+ANALYSIS_TIMEOUT = 15
+MAX_OUTPUT_BYTES = 4 * 1024 * 1024
+MAX_TIMELINE_BUCKETS = 301
+TOOLS = {
+    'tshark': 'Protocol dissection, conversations and expert fields',
+    'dumpcap': 'Efficient packet capture and ring-buffer support',
+    'capinfos': 'Capture-file metadata and integrity summary',
+    'tcpdump': 'Lightweight packet inspection and capture',
+    'zeek': 'Connection and protocol behaviour logs (optional)',
+    'suricata': 'Signature and protocol metadata engine (optional)',
+}
 
-FIELDS = (
-    "frame.number", "frame.time_epoch", "frame.time_relative",
-    "frame.time_delta_displayed", "frame.len", "frame.cap_len",
-    "frame.protocols", "eth.src", "eth.dst",
-    "ip.src", "ip.dst", "ip.ttl", "ipv6.src", "ipv6.dst", "ipv6.hlim",
-    "tcp.srcport", "tcp.dstport", "tcp.stream", "tcp.flags", "tcp.flags.str",
-    "tcp.seq", "tcp.ack", "tcp.window_size_value", "tcp.len",
-    "tcp.analysis.retransmission", "tcp.analysis.fast_retransmission",
-    "tcp.analysis.duplicate_ack", "tcp.analysis.out_of_order",
-    "tcp.analysis.zero_window",
-    "udp.srcport", "udp.dstport", "udp.length",
-    "dns.qry.name", "dns.qry.type", "dns.flags.rcode",
-    "tls.handshake.extensions_server_name", "tls.handshake.version",
-    "tls.record.version",
-)
-TCP_ANALYSIS_FIELDS = (
-    "tcp.analysis.retransmission", "tcp.analysis.fast_retransmission",
-    "tcp.analysis.duplicate_ack", "tcp.analysis.out_of_order",
-    "tcp.analysis.zero_window",
-)
+
+def _run(args: list[str], timeout: int = 3) -> tuple[int, str]:
+    try:
+        completed = subprocess.run(
+            args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, timeout=timeout, check=False,
+            env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C',
+                 'HOME': '/nonexistent'}, close_fds=True,
+        )
+        output = (completed.stdout or '')[:1200]
+        return completed.returncode, output
+    except (OSError, subprocess.TimeoutExpired):
+        return 127, ''
 
 
 def tool_inventory() -> dict[str, Any]:
-    names = {
-        "tshark": "Offline protocol dissection and TCP analysis",
-        "dumpcap": "Packet capture engine",
-        "capinfos": "Capture metadata and format inspection",
-        "tcpdump": "Packet inspection and capture filters",
-        "zeek": "Connection and protocol metadata analysis",
-        "suricata": "Network threat detection and protocol metadata",
-    }
-    return {
-        "ok": True,
-        "tools": [
-            {"name": name, "purpose": purpose,
-             "available": bool(shutil.which(name, path="/usr/sbin:/usr/bin:/sbin:/bin"))}
-            for name, purpose in names.items()
-        ],
-        "engine": "AF_PACKET live metadata plus bounded offline TShark analysis",
-    }
+    rows = []
+    for name, purpose in TOOLS.items():
+        binary = shutil.which(name, path='/usr/sbin:/usr/bin:/sbin:/bin')
+        version = None
+        if binary:
+            _, output = _run([binary, '--version'], timeout=2)
+            version = next((line.strip() for line in output.splitlines() if line.strip()), None)
+        rows.append({'name': name, 'available': bool(binary), 'version': version,
+                     'purpose': purpose, 'required': name == 'tshark'})
+    return {'ok': True, 'tools': rows,
+            'engine': 'native AF_PACKET live metadata + on-demand TShark PCAPNG dissection',
+            'live_capture_engine': 'packet_monitor.py / Linux AF_PACKET',
+            'deep_analysis': 'TShark runs only when explicitly requested against the last saved PCAPNG.'}
 
 
-def _validated_capture(value: str) -> Path:
-    if not isinstance(value, str) or not value:
-        raise ValueError("No capture selected.")
+def _validated_capture(path_value: str | None) -> Path:
+    if not isinstance(path_value, str) or not path_value:
+        raise ValueError('No saved PCAPNG is available. Enable “Save full PCAPNG” for a bounded capture first.')
     base = CAPTURE_DIR.resolve(strict=True)
-    candidate = Path(value)
+    candidate = Path(path_value)
     if candidate.is_symlink():
-        raise ValueError("Capture symlink rejected.")
-    path = candidate.resolve(strict=True)
-    stat = path.stat()
-    if (
-        path.parent != base
-        or path.suffix != ".pcapng"
-        or not path.is_file()
-        or stat.st_uid != 0
-        or stat.st_mode & 0o077
-        or not 0 < stat.st_size <= MAX_PCAP_BYTES
-    ):
-        raise ValueError("Capture must be root-owned, private and at most 32 MiB.")
-    return path
-
-
-def _as_int(value: Any) -> int | None:
+        raise ValueError('Capture file must not be a symbolic link.')
     try:
-        if value in (None, ""):
-            return None
-        return int(str(value).strip(), 0)
-    except (TypeError, ValueError):
-        try:
-            return int(float(value))
-        except (TypeError, ValueError):
-            return None
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError('Saved capture file is unavailable.') from exc
+    if resolved.parent != base or resolved.suffix.lower() != '.pcapng':
+        raise ValueError('Capture path is outside the approved PCAPNG directory.')
+    info = resolved.stat()
+    if not resolved.is_file() or info.st_uid != 0 or info.st_mode & 0o077:
+        raise ValueError('Capture file is not a root-owned, private regular file.')
+    if not 0 < info.st_size <= MAX_PCAP_BYTES:
+        raise ValueError('Capture file is empty or exceeds the 32 MiB analysis limit.')
+    return resolved
 
 
-def _as_float(value: Any) -> float | None:
+def _field_set(value: str) -> bool:
+    return bool(value and value.strip() not in ('0', '0x0000', 'False', 'false'))
+
+
+def _utc(epoch: float) -> str:
+    return dt.datetime.fromtimestamp(epoch, tz=dt.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+
+
+def analyse_capture(path_value: str | None) -> dict[str, Any]:
+    """Return aggregate protocol, conversation, timeline and TCP metadata."""
+    if os.geteuid() != 0:
+        return {'ok': False, 'error': 'TShark analysis requires the root control agent.'}
+    binary = shutil.which('tshark', path='/usr/sbin:/usr/bin:/sbin:/bin')
+    if not binary:
+        return {'ok': False, 'error': 'TShark is not installed. Install the tshark package, then retry.'}
     try:
-        if value in (None, ""):
-            return None
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+        capture = _validated_capture(path_value)
+    except (OSError, ValueError) as exc:
+        return {'ok': False, 'error': str(exc)}
 
+    # Keep this list explicit. We request only decoded header and expert fields,
+    # never Follow TCP Stream, reassembled application bodies or raw bytes.
+    fields = [
+        'frame.number', 'frame.protocols', 'frame.time_epoch',
+        'ip.src', 'ipv6.src', 'ip.dst', 'ipv6.dst',
+        'tcp.srcport', 'udp.srcport', 'tcp.dstport', 'udp.dstport',
+        'dns.qry.name', 'dns.flags.response', 'dns.flags.rcode',
+        'tls.handshake.extensions_server_name', 'http.host', 'frame.len',
+        'tcp.analysis.retransmission', 'tcp.analysis.fast_retransmission',
+        'tcp.analysis.spurious_retransmission', 'tcp.analysis.duplicate_ack',
+        'tcp.analysis.out_of_order', 'tcp.analysis.zero_window',
+        'tcp.analysis.ack_rtt', 'tcp.flags.syn', 'tcp.flags.reset',
+        'tcp.flags.fin', 'tcp.window_size_value',
+        'udp.length', 'icmp.type', 'icmpv6.type',
+        '_ws.expert.severity', '_ws.expert.message',
+    ]
+    args = [binary, '-n', '-r', str(capture), '-c', str(MAX_ANALYSED_PACKETS),
+            '-T', 'fields', '-E', 'separator=/t', '-E', 'occurrence=f', '-E', 'quote=n']
+    for field in fields:
+        args.extend(['-e', field])
+    started = time.monotonic()
+    try:
+        result = subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, timeout=ANALYSIS_TIMEOUT,
+                                check=False, env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin',
+                                                  'LC_ALL': 'C', 'HOME': '/nonexistent'},
+                                close_fds=True)
+    except subprocess.TimeoutExpired:
+        return {'ok': False, 'error': 'TShark analysis reached its 15-second safety limit. Try a shorter or smaller capture.'}
+    except OSError as exc:
+        return {'ok': False, 'error': f'Could not start TShark: {exc}'}
+    if len(result.stdout) > MAX_OUTPUT_BYTES:
+        return {'ok': False, 'error': 'TShark output exceeded the bounded analysis limit.'}
+    if result.returncode != 0:
+        error = result.stderr.decode('utf-8', 'replace')[:500]
+        return {'ok': False, 'error': 'TShark could not dissect this capture: ' + (error or f'exit {result.returncode}')}
 
-def _summarize_rows(rows: list[dict[str, str]]) -> dict[str, Any]:
     protocols: collections.Counter[str] = collections.Counter()
     endpoints: collections.Counter[str] = collections.Counter()
-    dns_names: collections.Counter[str] = collections.Counter()
-    tls_names: collections.Counter[str] = collections.Counter()
-    tcp_analysis: collections.Counter[str] = collections.Counter()
-    conversations: dict[tuple[str, str, str], dict[str, Any]] = {}
-    times: list[float] = []
-    deltas: list[float] = []
+    domains: collections.Counter[str] = collections.Counter()
+    tls_hosts: collections.Counter[str] = collections.Counter()
+    http_hosts: collections.Counter[str] = collections.Counter()
+    expert: collections.Counter[str] = collections.Counter()
+    dns_rcodes: collections.Counter[str] = collections.Counter()
+    conversations: dict[tuple[str, str], dict[str, Any]] = {}
+    timeline: dict[int, dict[str, int]] = {}
+    tcp_counts: collections.Counter[str] = collections.Counter()
+    icmp_types: collections.Counter[str] = collections.Counter()
+    rtt_values: list[float] = []
+    frames = 0
+    total_bytes = 0
+    first_epoch: float | None = None
+    last_epoch: float | None = None
 
-    for row in rows:
-        length = _as_int(row.get("frame.len")) or 0
-        protocol_stack = row.get("frame.protocols") or ""
-        for layer in dict.fromkeys(x for x in protocol_stack.split(":") if x):
-            protocols[layer] += 1
-
-        source = row.get("ip.src") or row.get("ipv6.src") or ""
-        destination = row.get("ip.dst") or row.get("ipv6.dst") or ""
-        tcp_sport = row.get("tcp.srcport") or ""
-        tcp_dport = row.get("tcp.dstport") or ""
-        udp_sport = row.get("udp.srcport") or ""
-        udp_dport = row.get("udp.dstport") or ""
-        source_port = tcp_sport or udp_sport
-        destination_port = tcp_dport or udp_dport
-        transport = "TCP" if tcp_sport or tcp_dport else ("UDP" if udp_sport or udp_dport else "IP")
-
-        if source:
-            endpoints[source] += length
-        if destination:
-            endpoints[destination] += length
-        if source and destination:
-            left = f"{source}:{source_port}" if source_port else source
-            right = f"{destination}:{destination_port}" if destination_port else destination
-            key = (transport, *sorted((left, right)))
-            item = conversations.setdefault(key, {
-                "transport": transport, "endpoint_a": key[1], "endpoint_b": key[2],
-                "packets": 0, "bytes": 0, "first_epoch": None, "last_epoch": None,
-                "tcp_stream": row.get("tcp.stream") or None,
-            })
-            item["packets"] += 1
-            item["bytes"] += length
-            epoch = _as_float(row.get("frame.time_epoch"))
-            if epoch is not None:
-                item["first_epoch"] = epoch if item["first_epoch"] is None else min(item["first_epoch"], epoch)
-                item["last_epoch"] = epoch if item["last_epoch"] is None else max(item["last_epoch"], epoch)
-
-        epoch = _as_float(row.get("frame.time_epoch"))
-        if epoch is not None:
-            times.append(epoch)
-        delta = _as_float(row.get("frame.time_delta_displayed"))
-        if delta is not None and delta >= 0:
-            deltas.append(delta)
-
-        dns_name = (row.get("dns.qry.name") or "").strip().lower()
-        if dns_name:
-            dns_names[dns_name] += 1
-        tls_name = (row.get("tls.handshake.extensions_server_name") or "").strip().lower()
-        if tls_name:
-            tls_names[tls_name] += 1
-        for field in TCP_ANALYSIS_FIELDS:
-            if row.get(field):
-                tcp_analysis[field] += 1
-
-    duration = max(times) - min(times) if len(times) > 1 else 0.0
-    return {
-        "protocol_layers": protocols.most_common(40),
-        "top_endpoints_by_observed_bytes": [
-            {"address": address, "observed_bytes": size}
-            for address, size in endpoints.most_common(20)
-        ],
-        "top_conversations": sorted(
-            conversations.values(), key=lambda item: item["bytes"], reverse=True
-        )[:30],
-        "dns_names": dns_names.most_common(100),
-        "tls_server_names": tls_names.most_common(100),
-        "tcp_analysis": {field: tcp_analysis.get(field, 0) for field in TCP_ANALYSIS_FIELDS},
-        "capture_time": {
-            "first_epoch": min(times) if times else None,
-            "last_epoch": max(times) if times else None,
-            "duration_seconds": duration,
-            "mean_interpacket_delta_seconds": (sum(deltas) / len(deltas)) if deltas else None,
-        },
+    tcp_flags = {
+        17: 'retransmissions',
+        18: 'fast_retransmissions',
+        19: 'spurious_retransmissions',
+        20: 'duplicate_acks',
+        21: 'out_of_order',
+        22: 'zero_window',
+        24: 'syn_packets',
+        25: 'reset_packets',
+        26: 'fin_packets',
     }
 
+    for row in csv.reader(io.StringIO(result.stdout.decode('utf-8', 'replace')), delimiter='\t'):
+        if not row or not any(row):
+            continue
+        if len(row) < len(fields):
+            row += [''] * (len(fields) - len(row))
+        frames += 1
+        for protocol in row[1].split(':'):
+            if protocol:
+                protocols[protocol.split('.')[-1].upper()] += 1
 
-def analyse_capture(value: str) -> dict[str, Any]:
-    if os.geteuid() != 0:
-        return {"ok": False, "error": "TShark requires the privileged agent."}
-    binary = shutil.which("tshark", path="/usr/sbin:/usr/bin:/sbin:/bin")
-    if not binary:
-        return {"ok": False, "error": "TShark is not installed."}
-    try:
-        path = _validated_capture(value)
-    except (OSError, ValueError) as exc:
-        return {"ok": False, "error": str(exc)}
+        try:
+            epoch = float(row[2]) if row[2] else None
+        except ValueError:
+            epoch = None
+        if epoch is not None:
+            first_epoch = epoch if first_epoch is None else min(first_epoch, epoch)
+            last_epoch = epoch if last_epoch is None else max(last_epoch, epoch)
+            bucket = int(epoch)
+            if bucket not in timeline and len(timeline) < MAX_TIMELINE_BUCKETS:
+                timeline[bucket] = {'packets': 0, 'bytes': 0}
+            if bucket in timeline:
+                timeline[bucket]['packets'] += 1
 
-    args = [
-        binary, "-2", "-n", "-r", str(path),
-        "-c", str(MAX_ANALYSED_PACKETS),
-        "-T", "fields",
-        "-E", "header=y", "-E", "separator=,", "-E", "quote=d", "-E", "occurrence=f",
+        src = row[3] or row[4]
+        dst = row[5] or row[6]
+        sport = row[7] or row[8]
+        dport = row[9] or row[10]
+        src_endpoint = f'{src}:{sport}' if src and sport else src
+        dst_endpoint = f'{dst}:{dport}' if dst and dport else dst
+        if src_endpoint:
+            endpoints[src_endpoint] += 1
+        if dst_endpoint:
+            endpoints[dst_endpoint] += 1
+
+        try:
+            frame_bytes = max(0, int(row[16] or 0))
+        except ValueError:
+            frame_bytes = 0
+        total_bytes += frame_bytes
+        if epoch is not None and int(epoch) in timeline:
+            timeline[int(epoch)]['bytes'] += frame_bytes
+
+        if src_endpoint and dst_endpoint:
+            pair = tuple(sorted((src_endpoint, dst_endpoint)))
+            conversation = conversations.setdefault(pair, {
+                'endpoint_a': pair[0], 'endpoint_b': pair[1], 'frames': 0, 'bytes': 0,
+            })
+            conversation['frames'] += 1
+            conversation['bytes'] += frame_bytes
+
+        if row[11]:
+            domains[row[11].lower().rstrip('.')] += 1
+        if row[12] == '1' and row[13]:
+            rcode = row[13].strip()
+            rcode_names = {'0': 'NOERROR', '1': 'FORMERR', '2': 'SERVFAIL',
+                           '3': 'NXDOMAIN', '4': 'NOTIMP', '5': 'REFUSED'}
+            dns_rcodes[rcode_names.get(rcode, f'RCODE {rcode}')] += 1
+        if row[14]:
+            tls_hosts[row[14].lower().rstrip('.')] += 1
+        if row[15]:
+            http_hosts[row[15].lower().rstrip('.')] += 1
+
+        for field_index, label in tcp_flags.items():
+            if _field_set(row[field_index]):
+                tcp_counts[label] += 1
+        try:
+            if row[23]:
+                rtt_values.append(float(row[23]) * 1000.0)
+        except ValueError:
+            pass
+        if row[29]:
+            icmp_types['ICMP type ' + row[29]] += 1
+        if row[30]:
+            icmp_types['ICMPv6 type ' + row[30]] += 1
+        if row[31] or row[32]:
+            severity = row[31].strip().upper() or 'NOTE'
+            message = row[32].strip()[:160] or 'Expert diagnostic'
+            expert[f'{severity}: {message}'] += 1
+
+        if row[27]:
+            try:
+                # A zero TCP window is a useful back-pressure indicator. Do not
+                # confuse it with the unrelated UDP length field at index 28.
+                window = int(row[27], 0)
+                tcp_counts['zero_window_advertisements'] += int(window == 0)
+            except ValueError:
+                pass
+    elapsed_ms = round((time.monotonic() - started) * 1000, 1)
+    timeline_rows = [
+        {'timestamp': float(second), 'timestamp_utc': _utc(float(second)),
+         'packets': values['packets'], 'bytes': values['bytes'],
+         'bytes_per_second': values['bytes'], 'packets_per_second': values['packets']}
+        for second, values in sorted(timeline.items())
     ]
-    for field in FIELDS:
-        args.extend(("-e", field))
-
-    try:
-        result = subprocess.run(
-            args, stdin=subprocess.DEVNULL, capture_output=True,
-            timeout=ANALYSIS_TIMEOUT_SECONDS,
-            env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C", "HOME": "/nonexistent"},
-            check=False,
-        )
-        if len(result.stdout) > MAX_OUTPUT_BYTES:
-            return {"ok": False, "error": "Analysis output exceeds 2 MiB."}
-        if result.returncode:
-            return {"ok": False, "error": result.stderr.decode(errors="replace")[:500]}
-
-        text = result.stdout.decode("utf-8", errors="replace")
-        reader = csv.DictReader(io.StringIO(text))
-        if not reader.fieldnames or "frame.protocols" not in reader.fieldnames:
-            return {"ok": False, "error": "TShark returned an unexpected fields table; CSV header is missing."}
-        rows = list(reader)
-        summary = _summarize_rows(rows)
-        return {
-            "ok": True,
-            "capture": path.name,
-            "packets_analysed": len(rows),
-            "packet_limit": MAX_ANALYSED_PACKETS,
-            "truncated_at_packet_limit": len(rows) >= MAX_ANALYSED_PACKETS,
-            "summary": summary,
-            "fields": rows[:500],
-            "fields_available": list(FIELDS),
-            "payloads_returned": False,
-            "analysis_mode": "offline TShark two-pass fields; payloads excluded",
-        }
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "error": f"TShark exceeded {ANALYSIS_TIMEOUT_SECONDS}-second limit."}
-    except (OSError, csv.Error) as exc:
-        return {"ok": False, "error": str(exc)[:240]}
-
-
-__all__ = ["analyse_capture", "tool_inventory", "_summarize_rows", "FIELDS"]
+    sorted_conversations = sorted(conversations.values(), key=lambda row: (row['bytes'], row['frames']), reverse=True)
+    rtt_summary = {
+        'samples': len(rtt_values),
+        'average_ms': round(sum(rtt_values) / len(rtt_values), 3) if rtt_values else None,
+        'maximum_ms': round(max(rtt_values), 3) if rtt_values else None,
+    }
+    return {
+        'ok': True,
+        'capture': {
+            'name': capture.name, 'bytes': capture.stat().st_size,
+            'analysed_packets': frames, 'packet_limit': MAX_ANALYSED_PACKETS,
+            'truncated_to_packet_limit': frames >= MAX_ANALYSED_PACKETS,
+            'first_packet_utc': _utc(first_epoch) if first_epoch is not None else None,
+            'last_packet_utc': _utc(last_epoch) if last_epoch is not None else None,
+            'observed_window_seconds': round(max(0.0, last_epoch - first_epoch), 3)
+            if first_epoch is not None and last_epoch is not None else 0.0,
+        },
+        'duration_ms': elapsed_ms,
+        'protocols': [{'name': key, 'frames': value} for key, value in protocols.most_common(24)],
+        'endpoints': [{'endpoint': key, 'frames': value} for key, value in endpoints.most_common(24)],
+        'conversations': [
+            {'conversation': f"{row['endpoint_a']} ↔ {row['endpoint_b']}",
+             'frames': row['frames'], 'bytes': row['bytes'],
+             'endpoint_a': row['endpoint_a'], 'endpoint_b': row['endpoint_b']}
+            for row in sorted_conversations[:24]
+        ],
+        'dns_queries': [{'name': key, 'count': value} for key, value in domains.most_common(30)],
+        'dns_rcodes': [{'name': key, 'count': value} for key, value in dns_rcodes.most_common(12)],
+        'tls_hosts': [{'name': key, 'count': value} for key, value in tls_hosts.most_common(30)],
+        'http_hosts': [{'name': key, 'count': value} for key, value in http_hosts.most_common(20)],
+        'expert': [{'message': key, 'count': value} for key, value in expert.most_common(24)],
+        'tcp_analysis': [{'name': key.replace('_', ' ').title(), 'count': value}
+                         for key, value in tcp_counts.most_common(20)],
+        'tcp_rtt': rtt_summary,
+        'icmp_types': [{'name': key, 'count': value} for key, value in icmp_types.most_common(16)],
+        'timeline': timeline_rows,
+        'total_frame_bytes': total_bytes,
+        'timeline_bucket_seconds': 1,
+        'privacy': 'Aggregate decoded metadata only. Packet payloads, stream contents and raw frame bytes are never returned to the portal.',
+        'analysis_limits': {'packet_limit': MAX_ANALYSED_PACKETS,
+                            'timeout_seconds': ANALYSIS_TIMEOUT,
+                            'output_limit_bytes': MAX_OUTPUT_BYTES,
+                            'timeline_bucket_limit': MAX_TIMELINE_BUCKETS},
+    }

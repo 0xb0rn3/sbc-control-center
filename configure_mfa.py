@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enable or disable TOTP multi-factor authentication for SBC Control Center."""
+"""Enable or disable TOTP multi-factor authentication for the Control Center."""
 from __future__ import annotations
 import argparse
 import base64
@@ -13,10 +13,13 @@ import tempfile
 import pwd
 import time
 from pathlib import Path
+import sbc_site
+
 from urllib.parse import quote
 
-AUTH = Path('/etc/sbc-control-center/auth.json')
-MFA_STATE = Path('/var/lib/sbc-control-center-web/totp-last-step')
+AUTH = sbc_site.ETC_DIR / 'auth.json'
+MFA_STATE = sbc_site.WEB_STATE_DIR / 'totp-last-step'
+LABEL = sbc_site.load()['device_label']
 
 
 def totp_counter(secret: str, code: str, now: float | None = None) -> int | None:
@@ -51,7 +54,7 @@ def save_auth(data: dict) -> None:
         os.chmod(tmp_name, 0o640)
         try:
             import grp
-            os.chown(tmp_name, 0, grp.getgrnam('sbc-control-center').gr_gid)
+            os.chown(tmp_name, 0, grp.getgrnam(sbc_site.PORTAL_GROUP).gr_gid)
         except (ImportError, KeyError, PermissionError):
             pass
         os.replace(tmp_name, AUTH)
@@ -71,7 +74,7 @@ def save_last_step(step: int) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         try:
-            account = pwd.getpwnam('sbc-control-center')
+            account = pwd.getpwnam(sbc_site.PORTAL_USER)
             os.chown(tmp_name, account.pw_uid, account.pw_gid)
         except KeyError:
             pass
@@ -85,13 +88,13 @@ def save_last_step(step: int) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description='Configure TOTP MFA for SBC Control Center')
+    parser = argparse.ArgumentParser(description=f'Configure TOTP MFA for {LABEL}')
     parser.add_argument('--disable', action='store_true', help='disable MFA (requires root console or SSH access)')
     args = parser.parse_args()
     if os.geteuid() != 0:
         raise SystemExit('Run as root: python3 configure_mfa.py')
     if not AUTH.is_file():
-        raise SystemExit('Portal auth file not found. Is SBC Control Center installed?')
+        raise SystemExit("Portal auth file not found. Is the Control Center installed?")
     data = json.loads(AUTH.read_text())
     if args.disable:
         if not data.get('totp_secret'):
@@ -108,9 +111,9 @@ def main() -> int:
     if data.get('totp_secret'):
         raise SystemExit('MFA is already enabled. Use --disable first if you need to replace the authenticator.')
     secret = base64.b32encode(secrets.token_bytes(20)).decode('ascii').rstrip('=')
-    uri = f'otpauth://totp/{quote("SBC Control Center:admin")}?secret={secret}&issuer={quote("SBC Control Center")}&algorithm=SHA1&digits=6&period=30'
+    uri = f'otpauth://totp/{quote(LABEL + ":admin")}?secret={secret}&issuer={quote(LABEL)}&algorithm=SHA1&digits=6&period=30'
     print('\nAdd a new TOTP account in your authenticator app.')
-    print('Account: SBC Control Center (admin)')
+    print(f'Account: {LABEL} (admin)')
     print('Type: time-based, 6 digits, 30-second period')
     print('\nSecret (enter manually):')
     print(secret)
@@ -129,7 +132,7 @@ def main() -> int:
     print('Future sign-ins require both your administrator password and a fresh authenticator code.')
     print('The enrollment code has been marked used. Wait for the next 30-second code before signing in.')
     print('Keep SSH/local-console access available. To recover if your authenticator is lost:')
-    print('  python3 /opt/sbc-control-center/configure_mfa.py --disable')
+    print(f'  python3 {sbc_site.APP_DIR}/configure_mfa.py --disable')
     return 0
 
 

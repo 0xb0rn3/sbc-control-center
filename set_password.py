@@ -8,8 +8,10 @@ import os
 import secrets
 import tempfile
 from pathlib import Path
+import sbc_site
 
-AUTH = Path('/etc/sbc-control-center/auth.json')
+
+AUTH = sbc_site.ETC_DIR / 'auth.json'
 ROUNDS = 600_000
 MIN_CHARS = 15
 MAX_BYTES = 1024
@@ -56,7 +58,7 @@ try:
     os.chmod(tmp_name, 0o640)
     try:
         import grp
-        os.chown(tmp_name, 0, grp.getgrnam('sbc-control-center').gr_gid)
+        os.chown(tmp_name, 0, grp.getgrnam(sbc_site.PORTAL_GROUP).gr_gid)
     except (ImportError, KeyError, PermissionError):
         pass
     os.replace(tmp_name, AUTH)

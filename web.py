@@ -6,12 +6,14 @@ import base64
 import fcntl
 import hashlib
 import hmac
+import html
 import http.cookies
 import ipaddress
 import json
 import re
 import os
 import pwd
+import queue
 import secrets
 import socket
 import ssl
@@ -25,11 +27,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import sbc_site
+
 try:
-    from security_operations import snapshot_from_capture, evidence_for_event
+    from threat_intelligence import snapshot as security_operations_snapshot, get_event_evidence as security_event_evidence
 except ImportError:
-    snapshot_from_capture = None  # type: ignore[assignment]
-    evidence_for_event = None  # type: ignore[assignment]
+    security_operations_snapshot = None  # type: ignore[assignment]
+    security_event_evidence = None  # type: ignore[assignment]
 
 try:
     from fido2.server import Fido2Server
@@ -48,16 +52,68 @@ except ImportError:
     AuthenticatorData = None  # type: ignore[assignment,misc]
     FIDO2_AVAILABLE = False
 
-BASE = Path('/etc/sbc-control-center')
-SOCKET_PATH = Path('/run/sbc-control-center/agent.sock')
+BASE = sbc_site.ETC_DIR
+SOCKET_PATH = sbc_site.SOCKET_PATH
 AUTH_PATH = BASE / 'auth.json'
 KEY_PATH = BASE / 'session.key'
-CERT_PATH = Path('/etc/sbc-control-center/tls.crt')
-PRIVATE_KEY_PATH = Path('/etc/sbc-control-center/tls.key')
-TOTP_STATE_PATH = Path('/var/lib/sbc-control-center-web/totp-last-step')
-PASSKEYS_PATH = Path('/var/lib/sbc-control-center-web/passkeys.json')
-HTML_PATH = Path('/opt/sbc-control-center/index.html')
-BACKGROUND_PATH = Path('/opt/sbc-control-center/assets/ui-background.png')
+CERT_PATH = sbc_site.ETC_DIR / 'tls.crt'
+PRIVATE_KEY_PATH = sbc_site.ETC_DIR / 'tls.key'
+TOTP_STATE_PATH = sbc_site.WEB_STATE_DIR / 'totp-last-step'
+PASSKEYS_PATH = sbc_site.WEB_STATE_DIR / 'passkeys.json'
+HTML_PATH = sbc_site.APP_DIR / 'index.html'
+BACKGROUND_PATH = sbc_site.APP_DIR / 'assets' / 'ui-background.png'
+ASSETS_DIR = sbc_site.APP_DIR / 'assets'
+# Static files the page loads: the bundled terminal library and the slideshow wallpapers. Only these
+# two folders, plain file names and known types are served; nothing outside them can be named.
+STATIC_TYPES = {'.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
+                '.jpg': 'image/jpeg', '.webp': 'image/webp', '.png': 'image/png', '.json': 'application/json'}
+STATIC_PATH = re.compile(r'/assets/(vendor|wallpapers)/([A-Za-z0-9][A-Za-z0-9_.-]{0,120})')
+STATIC_MAX_BYTES = 8 * 1024 * 1024
+
+
+def read_static_asset(path: str) -> tuple[bytes, str] | None:
+    match = STATIC_PATH.fullmatch(path)
+    if not match or '..' in match.group(2):
+        return None
+    kind = STATIC_TYPES.get(os.path.splitext(match.group(2))[1].lower())
+    if not kind:
+        return None
+    try:
+        fd = os.open(ASSETS_DIR / match.group(1) / match.group(2), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > STATIC_MAX_BYTES:
+            return None
+        with os.fdopen(fd, 'rb', closefd=False) as handle:
+            return handle.read(STATIC_MAX_BYTES + 1), kind
+    finally:
+        os.close(fd)
+# the board's label (config.json); shown on the login screen and in the title, HTML-escaped
+SITE = sbc_site.load()
+DEVICE_LABEL = SITE['device_label']
+
+
+def _page_tokens() -> list[tuple[bytes, bytes]]:
+    """The board's settings filled into index.html as it is served (escaped for where they land)."""
+    public = sbc_site.public_view(SITE)
+    words = [w for w in re.split(r'[^0-9A-Za-z]+', DEVICE_LABEL) if w]
+    initials = (''.join(w[0] for w in words[:2]) or 'SB').upper()
+    tokens = [(f'__SBC_SITE_{key.upper()}__'.encode(), html.escape(value).encode()) for key, value in public.items()]
+    tokens += [
+        (b'__SBC_SITE_JSON__', json.dumps(public).replace('<', '\\u003c').replace('>', '\\u003e').replace('&', '\\u0026').encode()),
+        (b'__SBC_DEVICE_LABEL__', html.escape(DEVICE_LABEL).encode()),
+        (b'__SBC_DEVICE_INITIALS__', html.escape(initials).encode()),
+        (b'__SBC_APP_DIR__', html.escape(str(sbc_site.APP_DIR)).encode()),
+        (b'__SBC_AGENT_UNIT__', sbc_site.AGENT_UNIT.encode()),
+        (b'__SBC_WEB_UNIT__', sbc_site.WEB_UNIT.encode()),
+    ]
+    # longest first, so no token is cut by a shorter one that prefixes it
+    return sorted(tokens, key=lambda item: -len(item[0]))
+
+
+PAGE_TOKENS = _page_tokens()
 BIND = os.environ.get('PORTAL_BIND', '0.0.0.0')
 PORT = int(os.environ.get('PORTAL_PORT', '8443'))
 SESSION_IDLE_TTL = 20 * 60
@@ -74,7 +130,7 @@ COOKIE_NAME = '__Host-kpc_session'
 PASSKEY_MAX_CREDENTIALS = 10
 WEBAUTHN_CHALLENGE_TTL = 120
 WEBAUTHN_MANAGEMENT_TTL = 300
-WEBAUTHN_USER_ID = hashlib.sha256(b'sbc-control-center-admin').digest()
+WEBAUTHN_USER_ID = hashlib.sha256(f'{sbc_site.NAME}-admin'.encode()).digest()
 
 
 def valid_webauthn_rp_id(value: str) -> bool:
@@ -99,7 +155,7 @@ def valid_webauthn_rp_id(value: str) -> bool:
     )
 
 
-_configured_rp_id = os.environ.get('PORTAL_WEBAUTHN_RP_ID', 'sbc-control-center.local').strip().lower().rstrip('.')
+_configured_rp_id = os.environ.get('PORTAL_WEBAUTHN_RP_ID', f'{sbc_site.NAME}.local').strip().lower().rstrip('.')
 WEBAUTHN_RP_ID = _configured_rp_id if valid_webauthn_rp_id(_configured_rp_id) else ''
 WEBAUTHN_ORIGIN = f'https://{WEBAUTHN_RP_ID}:{PORT}' if WEBAUTHN_RP_ID else ''
 webauthn_challenges: dict[str, dict[str, Any]] = {}
@@ -340,7 +396,7 @@ def passkey_server() -> Any:
         raise RuntimeError('Passkey support is unavailable. Configure a stable DNS hostname and install python3-fido2.')
     # Explicit origin allowlist. Never derive the RP ID or trusted origin from headers.
     return Fido2Server(
-        {'id': WEBAUTHN_RP_ID, 'name': "SBC Control Center"},
+        {'id': WEBAUTHN_RP_ID, 'name': DEVICE_LABEL},
         attestation='none',
         verify_origin=lambda origin: isinstance(origin, str) and hmac.compare_digest(origin, WEBAUTHN_ORIGIN),
     )
@@ -525,15 +581,16 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'SBCControlCenter'
+    server_version = sbc_site.USER_AGENT
     sys_version = ''
 
     def log_message(self, fmt: str, *args: Any) -> None:
         # Avoid logging cookies, request bodies, or credentials.
         print(f'[{self.log_date_time_string()}] {client_ip(self)} {fmt % args}', flush=True)
 
-    def security_headers(self, nonce: str | None = None) -> None:
-        self.send_header('Cache-Control', 'no-store')
+    def security_headers(self, nonce: str | None = None, cache: str = 'no-store') -> None:
+        # one Cache-Control header only: a second one would combine with no-store and disable caching
+        self.send_header('Cache-Control', cache)
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('X-Frame-Options', 'DENY')
         self.send_header('Referrer-Policy', 'no-referrer')
@@ -686,12 +743,271 @@ class Handler(BaseHTTPRequestHandler):
             current = sessions.get(sid)
             return bool(current and current.get('passkey_manage_until', 0) >= time.time())
 
+    def handle_terminal_websocket(self) -> None:
+        """Authenticated, same-origin WebSocket bridge for the root-side PTY broker."""
+        auth = self.require_session()
+        if not auth:
+            return
+        sid, item = auth
+        origin = self.headers.get('Origin', '')
+        if (not isinstance(self.connection, ssl.SSLSocket) or not origin
+                or not self.same_origin_request()):
+            self.send_json(403, {'ok': False, 'error': 'The live terminal requires the authenticated HTTPS origin.'})
+            return
+        upgrade = self.headers.get('Upgrade', '').strip().lower()
+        connection_tokens = {part.strip().lower() for part in self.headers.get('Connection', '').split(',')}
+        version = self.headers.get('Sec-WebSocket-Version', '').strip()
+        protocol_tokens = {part.strip() for part in self.headers.get('Sec-WebSocket-Protocol', '').split(',')}
+        key = self.headers.get('Sec-WebSocket-Key', '').strip()
+        try:
+            decoded_key = base64.b64decode(key, validate=True)
+        except Exception:
+            decoded_key = b''
+        if (upgrade != 'websocket' or 'upgrade' not in connection_tokens or version != '13'
+                or 'sbc-terminal-v1' not in protocol_tokens or len(decoded_key) != 16):
+            self.send_json(400, {'ok': False, 'error': 'Invalid WebSocket upgrade request.'})
+            return
+
+        accept = base64.b64encode(hashlib.sha1(
+            (key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode('ascii')
+        ).digest()).decode('ascii')
+        self.send_response(101, 'Switching Protocols')
+        self.send_header('Upgrade', 'websocket')
+        self.send_header('Connection', 'Upgrade')
+        self.send_header('Sec-WebSocket-Accept', accept)
+        self.send_header('Sec-WebSocket-Protocol', 'sbc-terminal-v1')
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.flush()
+        self.close_connection = True
+        try:
+            self.connection.settimeout(45)
+        except OSError:
+            return
+
+        send_lock = threading.Lock()
+        incoming: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=128)
+        reader_done = threading.Event()
+        explicit_close = False
+        terminal_id: str | None = None
+
+        def send_frame(payload: bytes, opcode: int = 1) -> None:
+            if not isinstance(payload, bytes):
+                payload = bytes(payload)
+            first = 0x80 | (opcode & 0x0F)
+            length = len(payload)
+            if length < 126:
+                header = bytes((first, length))
+            elif length <= 0xFFFF:
+                header = bytes((first, 126)) + struct.pack('!H', length)
+            else:
+                header = bytes((first, 127)) + struct.pack('!Q', length)
+            with send_lock:
+                self.connection.sendall(header + payload)
+
+        def send_event(payload: dict[str, Any]) -> None:
+            send_frame(json.dumps(payload, separators=(',', ':'), ensure_ascii=False).encode('utf-8'))
+
+        def read_exact(length: int) -> bytes:
+            chunks = bytearray()
+            while len(chunks) < length:
+                part = self.rfile.read(length - len(chunks))
+                if not part:
+                    raise EOFError('WebSocket client disconnected.')
+                chunks.extend(part)
+            return bytes(chunks)
+
+        def reader() -> None:
+            try:
+                while not reader_done.is_set():
+                    head = read_exact(2)
+                    first, second = head
+                    fin = bool(first & 0x80)
+                    opcode = first & 0x0F
+                    masked = bool(second & 0x80)
+                    length = second & 0x7F
+                    if (first & 0x70) or not fin or not masked:
+                        raise ValueError('Unsupported or malformed WebSocket frame.')
+                    if length == 126:
+                        length = struct.unpack('!H', read_exact(2))[0]
+                    elif length == 127:
+                        length = struct.unpack('!Q', read_exact(8))[0]
+                        if length >> 63:
+                            raise ValueError('Invalid WebSocket frame length.')
+                    if length > 16384 or (opcode >= 8 and length > 125):
+                        raise ValueError('WebSocket frame exceeds the input limit.')
+                    mask = read_exact(4) if masked else b''
+                    payload = read_exact(length) if length else b''
+                    if masked:
+                        payload = bytes(value ^ mask[index & 3] for index, value in enumerate(payload))
+                    if opcode == 8:
+                        incoming.put_nowait({'type': 'disconnect'})
+                        return
+                    if opcode == 9:
+                        send_frame(payload, 10)
+                        continue
+                    if opcode == 10:
+                        continue
+                    if opcode != 1:
+                        raise ValueError('Only text control messages are supported.')
+                    message = json.loads(payload.decode('utf-8'))
+                    if not isinstance(message, dict) or not isinstance(message.get('type'), str):
+                        raise ValueError('Invalid terminal control message.')
+                    incoming.put(message, timeout=1)
+            except Exception as exc:
+                try:
+                    incoming.put_nowait({'type': 'disconnect', 'reason': str(exc)[:160]})
+                except queue.Full:
+                    pass
+            finally:
+                reader_done.set()
+
+        reader_thread = threading.Thread(target=reader, daemon=True, name='terminal-websocket-reader')
+        reader_thread.start()
+
+        def session_is_live(touch: bool = False) -> bool:
+            now = time.time()
+            with sessions_lock:
+                current = sessions.get(sid)
+                if (not current or now - current.get('created', 0) > SESSION_ABSOLUTE_TTL
+                        or now - current.get('last_activity', 0) > SESSION_IDLE_TTL):
+                    sessions.pop(sid, None)
+                    return False
+                if touch:
+                    current['last_activity'] = now
+                return True
+
+        try:
+            try:
+                first_message = incoming.get(timeout=5)
+            except queue.Empty:
+                send_event({'type': 'error', 'error': 'Terminal authentication timed out.'})
+                return
+            if first_message.get('type') != 'auth' or not hmac.compare_digest(
+                    str(first_message.get('csrf', '')), item.get('csrf', '')):
+                send_event({'type': 'error', 'error': 'Terminal CSRF authentication failed.'})
+                return
+            if not session_is_live():
+                send_event({'type': 'error', 'error': 'Your portal session has expired. Sign in again.'})
+                return
+
+            resume_id = first_message.get('terminal_id')
+            if resume_id:
+                result = agent_request({'action': 'terminal_attach', 'session_id': sid,
+                                        'terminal_id': resume_id}, timeout=5)
+            else:
+                token = first_message.get('privilege_token')
+                if not isinstance(token, str) or not 20 <= len(token) <= 128:
+                    send_event({'type': 'error', 'error': 'Fresh Linux sudo-password verification is required to start a root shell.'})
+                    return
+                rows = first_message.get('rows', 28)
+                cols = first_message.get('cols', 100)
+                result = agent_request({'action': 'terminal_start', 'session_id': sid,
+                                        'privilege_token': token, 'client_ip': client_ip(self),
+                                        'rows': rows, 'cols': cols}, timeout=8)
+            if not result.get('ok'):
+                send_event({'type': 'error', 'error': result.get('error', 'The terminal could not be started.')})
+                return
+            terminal_id = result.get('terminal_id')
+            if not isinstance(terminal_id, str):
+                send_event({'type': 'error', 'error': 'The terminal broker returned an invalid session.'})
+                return
+            send_event({'type': 'ready', 'terminal_id': terminal_id, 'user': 'root',
+                        'idle_timeout_seconds': result.get('idle_timeout_seconds', 900),
+                        'maximum_lifetime_seconds': result.get('maximum_lifetime_seconds', 3600)})
+
+            next_poll = 0.0
+            next_ping = time.monotonic() + 20
+            last_activity_check = 0.0
+            while not reader_done.is_set():
+                try:
+                    message = incoming.get(timeout=0.05)
+                except queue.Empty:
+                    message = None
+                if message:
+                    kind = message.get('type')
+                    if kind == 'disconnect':
+                        break
+                    if kind == 'close':
+                        explicit_close = True
+                        break
+                    if kind == 'input':
+                        data = message.get('data')
+                        if not isinstance(data, str) or not data or len(data.encode('utf-8')) > 8192:
+                            send_event({'type': 'error', 'error': 'Terminal input is empty or too large.'})
+                            continue
+                        encoded = base64.b64encode(data.encode('utf-8')).decode('ascii')
+                        write_result = agent_request({'action': 'terminal_input', 'session_id': sid,
+                                                      'terminal_id': terminal_id, 'data_b64': encoded}, timeout=3)
+                        if not write_result.get('ok'):
+                            send_event({'type': 'error', 'error': write_result.get('error', 'Terminal input failed.')})
+                            if 'no longer available' in str(write_result.get('error', '')).lower():
+                                break
+                        session_is_live(touch=True)
+                    elif kind == 'resize':
+                        resize_result = agent_request({'action': 'terminal_resize', 'session_id': sid,
+                                                       'terminal_id': terminal_id,
+                                                       'rows': message.get('rows'), 'cols': message.get('cols')}, timeout=3)
+                        if not resize_result.get('ok'):
+                            send_event({'type': 'error', 'error': resize_result.get('error', 'Terminal resize failed.')})
+                        session_is_live(touch=True)
+                    elif kind == 'ping':
+                        send_event({'type': 'pong'})
+                    else:
+                        send_event({'type': 'error', 'error': 'Unsupported terminal control message.'})
+
+                now_mono = time.monotonic()
+                if now_mono >= next_poll:
+                    if now_mono - last_activity_check >= 5:
+                        if not session_is_live():
+                            send_event({'type': 'error', 'error': 'Your portal session expired. The root shell was closed.'})
+                            agent_request({'action': 'terminal_close_session', 'session_id': sid}, timeout=3)
+                            explicit_close = True
+                            break
+                        last_activity_check = now_mono
+                    output = agent_request({'action': 'terminal_read', 'session_id': sid,
+                                            'terminal_id': terminal_id, 'max_bytes': 8192}, timeout=3)
+                    if not output.get('ok'):
+                        send_event({'type': 'error', 'error': output.get('error', 'Terminal output is unavailable.')})
+                        break
+                    encoded_output = output.get('data_b64', '')
+                    if encoded_output:
+                        send_event({'type': 'output', 'data_b64': encoded_output})
+                    if not output.get('running', True):
+                        send_event({'type': 'exited', 'exit_code': output.get('exit_code')})
+                        explicit_close = True
+                        break
+                    next_poll = now_mono + 0.12
+                if now_mono >= next_ping:
+                    send_frame(secrets.token_bytes(4), 9)
+                    next_ping = now_mono + 20
+        except (OSError, EOFError, ValueError) as exc:
+            try:
+                send_event({'type': 'error', 'error': str(exc)[:200]})
+            except OSError:
+                pass
+        finally:
+            if terminal_id and explicit_close:
+                try:
+                    agent_request({'action': 'terminal_close', 'session_id': sid,
+                                   'terminal_id': terminal_id}, timeout=3)
+                except Exception:
+                    pass
+            reader_done.set()
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
     def do_GET(self) -> None:
         if not local_host_header_allowed(self.headers.get('Host', '')):
             self.send_error(421, 'Misdirected Request')
             return
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+        if path == '/ws/terminal':
+            self.handle_terminal_websocket()
+            return
         if path == '/assets/ui-background.png':
             try:
                 body = BACKGROUND_PATH.read_bytes()
@@ -701,8 +1017,20 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-Type', 'image/png')
             self.send_header('Content-Length', str(len(body)))
-            self.security_headers()
-            self.send_header('Cache-Control', 'public, max-age=86400')
+            self.security_headers(cache='public, max-age=86400')
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path.startswith('/assets/vendor/') or path.startswith('/assets/wallpapers/'):
+            asset = read_static_asset(path)
+            if asset is None:
+                self.send_error(404, 'Asset not found')
+                return
+            body, kind = asset
+            self.send_response(200)
+            self.send_header('Content-Type', kind)
+            self.send_header('Content-Length', str(len(body)))
+            self.security_headers(cache='public, max-age=86400')
             self.end_headers()
             self.wfile.write(body)
             return
@@ -710,9 +1038,11 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 body = HTML_PATH.read_bytes()
             except Exception:
-                body = b'SBC Control Center UI file is missing.'
+                body = b'Control Center UI file is missing.'
             nonce = secrets.token_urlsafe(18)
             body = body.replace(b'<script>', f'<script nonce="{nonce}">'.encode(), 1)
+            for token, value in PAGE_TOKENS:
+                body = body.replace(token, value)
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
             self.send_header('Content-Length', str(len(body)))
@@ -784,96 +1114,79 @@ class Handler(BaseHTTPRequestHandler):
             auth = self.require_session()
             if not auth:
                 return
-            query = urllib.parse.parse_qs(parsed.query, keep_blank_values=False)
-            try:
-                after = int(query.get('after', ['0'])[0])
-                limit = int(query.get('limit', ['900'])[0])
-                if after < 0 or not 1 <= limit <= 900:
-                    raise ValueError
-            except (TypeError, ValueError):
-                self.send_json(400, {'ok': False, 'error': 'Invalid telemetry cursor or limit.'})
-                return
-            result = agent_request({'action': 'telemetry', 'after_sequence': after, 'limit': limit}, timeout=5)
+            result = agent_request({'action': 'telemetry'}, timeout=5)
             self.send_json(200 if result.get('ok') else 503, result)
             return
-        if path == '/api/network-observability':
+        if path == '/api/dns-filter':
             auth = self.require_session()
             if not auth:
                 return
-            result = agent_request({'action': 'network_inventory'}, timeout=20)
+            result = agent_request({'action': 'dns_status'}, timeout=8)
             self.send_json(200 if result.get('ok') else 503, result)
             return
         if path == '/api/security-operations':
             auth = self.require_session()
             if not auth:
                 return
-            if snapshot_from_capture is None:
+            if security_operations_snapshot is None:
                 self.send_json(503, {'ok': False, 'error': 'Security operations module is unavailable.'})
                 return
-            capture = agent_request({'action': 'packet_capture_snapshot', 'after': 0, 'limit': 250}, timeout=6)
-            if not capture.get('ok'):
-                self.send_json(503, capture)
-                return
-            self.send_json(200, snapshot_from_capture(capture))
+            self.send_json(200, security_operations_snapshot())
             return
         if path == '/api/security-event':
             auth = self.require_session()
             if not auth:
                 return
-            event_id = urllib.parse.parse_qs(parsed.query, keep_blank_values=False).get('id', [''])[0]
+            query = urllib.parse.parse_qs(parsed.query, keep_blank_values=False)
+            event_id = query.get('id', [''])[0]
             if not re.fullmatch(r'ev_[a-f0-9]{24}', event_id):
-                self.send_json(400, {'ok': False, 'error': 'Invalid packet evidence identifier.'})
+                self.send_json(400, {'ok': False, 'error': 'Invalid event evidence identifier.'})
                 return
-            if evidence_for_event is None:
-                self.send_json(503, {'ok': False, 'error': 'Packet evidence module is unavailable.'})
+            if security_event_evidence is None:
+                self.send_json(503, {'ok': False, 'error': 'Security evidence module is unavailable.'})
                 return
-            capture = agent_request({'action': 'packet_capture_snapshot', 'after': 0, 'limit': 250}, timeout=6)
-            if not capture.get('ok'):
-                self.send_json(503, capture)
-                return
-            evidence = evidence_for_event(event_id, capture)
+            evidence = security_event_evidence(event_id)
             if evidence is None:
-                self.send_json(404, {'ok': False, 'error': 'Packet event is no longer retained in the bounded capture ring.'})
+                self.send_json(404, {'ok': False, 'error': 'The source sensor record is no longer retained. It may have rotated out.'})
                 return
             self.send_json(200, evidence)
             return
-        if path == '/api/packet-flow-series':
+        if path == '/api/packet-tools':
             auth = self.require_session()
             if not auth:
                 return
-            query = urllib.parse.parse_qs(parsed.query, keep_blank_values=False)
-            flow_id = query.get('flow_id', [''])[0]
-            try:
-                limit = int(query.get('limit', ['60'])[0])
-                if not re.fullmatch(r'[0-9a-f]{24}', flow_id) or not 1 <= limit <= 60:
-                    raise ValueError
-            except (TypeError, ValueError):
-                self.send_json(400, {'ok': False, 'error': 'Invalid flow identifier or history limit.'})
-                return
-            result = agent_request({'action': 'packet_flow_series', 'flow_id': flow_id, 'limit': limit}, timeout=5)
-            self.send_json(200 if result.get('ok') else 404, result)
+            result = agent_request({'action': 'packet_tools'}, timeout=8)
+            self.send_json(200 if result.get('ok') else 503, result)
             return
-        if path == '/api/packet-capture':
+        if path == '/api/packet-monitor':
             auth = self.require_session()
             if not auth:
                 return
             query = urllib.parse.parse_qs(parsed.query, keep_blank_values=False)
             try:
                 after = int(query.get('after', ['0'])[0])
-                limit = int(query.get('limit', ['200'])[0])
-                if after < 0 or not 0 <= limit <= 250:
-                    raise ValueError
+                limit = int(query.get('limit', ['120'])[0])
             except (TypeError, ValueError):
-                self.send_json(400, {'ok': False, 'error': 'Invalid packet event cursor or limit.'})
+                self.send_json(400, {'ok': False, 'error': 'Invalid packet cursor.'})
                 return
-            result = agent_request({'action': 'packet_capture_snapshot', 'after': after, 'limit': limit}, timeout=5)
+            if after < 0 or not 0 <= limit <= 250:
+                self.send_json(400, {'ok': False, 'error': 'Packet cursor or page size is outside the allowed range.'})
+                return
+            result = agent_request({'action': 'packet_snapshot', 'after': after, 'limit': limit}, timeout=8)
             self.send_json(200 if result.get('ok') else 503, result)
             return
-        if path == '/api/dns-query-log':
+        if path == '/api/adapters':
             auth = self.require_session()
             if not auth:
                 return
-            result = agent_request({'action': 'dns_query_log', 'limit': 50}, timeout=5)
+            result = agent_request({'action': 'adapter_status'}, timeout=18)
+            self.send_json(200 if result.get('ok') else 503, result)
+            return
+        if path == '/api/device-discovery-events':
+            auth = self.require_session()
+            if not auth:
+                return
+            result = agent_request({'action': 'device_discovery_events', 'limit': 20}, timeout=5)
             self.send_json(200 if result.get('ok') else 503, result)
             return
         if path == '/api/job':
@@ -1053,7 +1366,7 @@ class Handler(BaseHTTPRequestHandler):
             if not allowed.get('ok'):
                 self.send_json(403, allowed)
                 return
-            backup_path = Path('/var/lib/sbc-control-center/backups') / name
+            backup_path = sbc_site.STATE_DIR / 'backups' / name
             fd = None
             try:
                 fd = os.open(backup_path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0))
@@ -1146,7 +1459,7 @@ class Handler(BaseHTTPRequestHandler):
                     if len(records) >= PASSKEY_MAX_CREDENTIALS:
                         raise ValueError(f'You can register up to {PASSKEY_MAX_CREDENTIALS} passkeys.')
                     creation_options, state = passkey_server().register_begin(
-                        {'id': WEBAUTHN_USER_ID, 'name': 'admin', 'displayName': "SBC Control Center"},
+                        {'id': WEBAUTHN_USER_ID, 'name': 'admin', 'displayName': DEVICE_LABEL},
                         credentials=passkey_credential_objects(records),
                         resident_key_requirement='required',
                         user_verification='required',
@@ -1235,6 +1548,7 @@ class Handler(BaseHTTPRequestHandler):
             if not self.verify_csrf(item):
                 self.send_json(403, {'ok': False, 'error': 'CSRF validation failed.'})
                 return
+            agent_request({'action': 'terminal_close_session', 'session_id': sid}, timeout=4)
             with sessions_lock:
                 sessions.pop(sid, None)
             self.send_json(200, {'ok': True}, {'Set-Cookie': f'{COOKIE_NAME}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0'})
@@ -1264,21 +1578,24 @@ class Handler(BaseHTTPRequestHandler):
                 payload = {'action': 'portal_update_source', 'repo': data.get('repo')}
             elif action == 'portal_update_check':
                 payload = {'action': 'portal_update_check'}
-            elif action == 'network_scan':
-                payload = {'action': 'network_scan', 'interfaces': data.get('interfaces')}
-            elif action == 'network_fingerprint':
-                payload = {'action': 'network_fingerprint', 'address': data.get('address')}
-            elif action == 'packet_capture_start':
-                payload = {'action': 'packet_capture_start', 'duration_seconds': data.get('duration_seconds'),
-                           'interfaces': data.get('interfaces'), 'save_pcap': data.get('save_pcap', False)}
-            elif action == 'packet_capture_stop':
-                payload = {'action': 'packet_capture_stop'}
-            elif action == 'packet_analyse':
-                payload = {'action': 'packet_analyse', 'name': data.get('name')}
-            elif action == 'network_label':
-                payload = {'action': 'network_label', 'mac': data.get('mac'), 'label': data.get('label')}
-            elif action == 'network_unlabel':
-                payload = {'action': 'network_unlabel', 'mac': data.get('mac')}
+            elif action == 'dns_profile':
+                payload = {'action': 'dns_profile', 'profile': data.get('profile')}
+            elif action == 'packet_start':
+                payload = {'action': 'packet_start', 'interfaces': data.get('interfaces'),
+                           'duration_seconds': data.get('duration_seconds'),
+                           'save_pcap': data.get('save_pcap', False)}
+            elif action == 'packet_stop':
+                payload = {'action': 'packet_stop'}
+            elif action == 'packet_analysis':
+                payload = {'action': 'packet_analysis'}
+            elif action == 'device_label':
+                payload = {'action': 'device_label', 'mac': data.get('mac'), 'label': data.get('label')}
+            elif action == 'device_unlabel':
+                payload = {'action': 'device_unlabel', 'mac': data.get('mac')}
+            elif action == 'device_scan':
+                payload = {'action': 'device_scan', 'interfaces': data.get('interfaces')}
+            elif action == 'device_fingerprint':
+                payload = {'action': 'device_fingerprint', 'ip': data.get('ip')}
             else:
                 self.send_json(400, {'ok': False, 'error': 'Unsupported action.'})
                 return
@@ -1304,7 +1621,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def drop_web_privileges() -> int:
     """Drop to the dedicated unprivileged account before opening the HTTP listener."""
-    account = pwd.getpwnam('sbc-control-center')
+    account = pwd.getpwnam(sbc_site.PORTAL_USER)
     current_uid = os.geteuid()
     if current_uid == 0:
         # Do not inherit optional groups (for example sudo/adm) from the host account.
@@ -1313,7 +1630,7 @@ def drop_web_privileges() -> int:
         os.setuid(account.pw_uid)
         current_uid = os.geteuid()
     if account.pw_uid == 0 or current_uid != account.pw_uid:
-        raise PermissionError('The web portal must run as the unprivileged sbc-control-center account.')
+        raise PermissionError(f'The web portal must run as the unprivileged {sbc_site.PORTAL_USER} account.')
     # Refuse unexpected supplementary capabilities such as adm, sudo, or docker.
     # systemd starts this service with only its dedicated primary group.
     unexpected_groups = set(os.getgroups()) - {account.pw_gid}
@@ -1341,7 +1658,7 @@ def main() -> None:
         raise SystemExit(f'HTTPS startup refused: {exc}') from exc
     server = BoundedThreadingHTTPServer((BIND, PORT), Handler)
     server.socket = context.wrap_socket(server.socket, server_side=True)
-    print(f'SBC Control Center listening on https://{BIND}:{PORT}', flush=True)
+    print(f"{DEVICE_LABEL} listening on https://{BIND}:{PORT}", flush=True)
     server.serve_forever()
 
 

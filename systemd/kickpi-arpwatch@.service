@@ -1,0 +1,35 @@
+[Unit]
+Description=KickPi passive ARP identity monitor on %i
+Documentation=man:arpwatch(8)
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/sys/class/net/%i
+
+[Service]
+Type=simple
+User=arpwatch
+Group=arpwatch
+StateDirectory=kickpi-arpwatch
+StateDirectoryMode=0750
+ExecStartPre=/usr/bin/touch /var/lib/kickpi-arpwatch/%i.dat
+ExecStart=/usr/sbin/arpwatch -d -N -Q -p -i %i -f /var/lib/kickpi-arpwatch/%i.dat
+Restart=on-failure
+RestartSec=3
+UMask=0027
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=CAP_NET_RAW
+AmbientCapabilities=CAP_NET_RAW
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_PACKET
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/kickpi-arpwatch
+
+[Install]
+WantedBy=multi-user.target

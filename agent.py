@@ -2,6 +2,7 @@
 """Root-side, allow-listed control agent for SBC Control Center."""
 from __future__ import annotations
 
+import base64
 import json
 import os
 import selectors
@@ -33,36 +34,30 @@ from pathlib import Path
 from typing import Any
 
 import telemetry
-import realtime_telemetry
-import network_observability
 import pam_auth
+import dns_filter
+import packet_monitor
+import packet_analysis
+import wireless_adapter
+import device_intelligence
+import network_discovery
+import terminal_pty
+import sbc_site
 
-BASE = Path('/etc/sbc-control-center')
-STATE = Path('/var/lib/sbc-control-center')
-SOCKET_DIR = Path('/run/sbc-control-center')
-SOCKET_PATH = SOCKET_DIR / 'agent.sock'
-CONFIG_PATH = BASE / 'config.json'
+BASE = sbc_site.ETC_DIR
+STATE = sbc_site.STATE_DIR
+SOCKET_DIR = sbc_site.RUN_DIR
+SOCKET_PATH = sbc_site.SOCKET_PATH
+CONFIG_PATH = sbc_site.CONFIG_PATH
 UPDATE_SOURCE_PATH = BASE / 'update-source.json'
 UPDATE_STATE_PATH = STATE / 'portal-update.json'
 PRIVILEGE_CONFIG_PATH = BASE / 'privilege.json'
-APP_VERSION_PATH = Path('/opt/sbc-control-center/VERSION')
+APP_VERSION_PATH = sbc_site.APP_DIR / 'VERSION'
 PORTAL_UPDATE_INTERVAL_SECONDS = 6 * 60 * 60
 MAX_CONSOLE_OUTPUT = 16_000
 PRIVILEGE_GRANT_TTL = 120
 
-DEFAULT_CONFIG = {
-    'ap_interface': 'wlan1',
-    'ap_ssid': 'SBC-5G',
-    'ap_ip': '10.50.0.1',
-    'ap_subnet': '10.50.0.0/24',
-    'vpn_interface': 'wg0',
-    'vpn_unit': 'wg-quick@wg0',
-    'dhcp_lease_file': '/var/lib/misc/dnsmasq.leases',
-    'ap2_interface': 'wlan0',
-    'ap2_ssid': 'SBC-2G',
-    'ap2_ip': '10.60.0.1',
-    'ap2_subnet': '10.60.0.0/24',
-}
+DEFAULT_CONFIG = dict(sbc_site.DEFAULTS)
 
 SERVICE_LABELS = {
     'hostapd': 'Wi-Fi access point · 5 GHz',
@@ -71,11 +66,11 @@ SERVICE_LABELS = {
     'apguard': 'VPN kill-switch firewall',
     'ap-iface': '5 GHz AP interface and policy routing',
     'ap2-iface': '2.4 GHz AP interface and policy routing',
-    'wg-quick@wg0': 'WireGuard tunnel',
     'systemd-networkd': 'Network management',
     'ssh': 'SSH access',
-    'sbc-control-center-agent': 'Control Center privileged agent',
-    'sbc-control-center-web': 'Control Center web portal',
+    sbc_site.AGENT_UNIT: 'Control Center privileged agent',
+    sbc_site.WEB_UNIT: 'Control Center web portal',
+    'adguardhome': 'DNS filtering service',
 }
 
 # The web portal cannot send arbitrary unit names or command arguments.
@@ -83,7 +78,6 @@ CONTROL_SERVICES = {
     'hostapd': {'start', 'stop', 'restart', 'enable', 'disable'},
     'hostapd-2g': {'start', 'stop', 'restart', 'enable', 'disable'},
     'dnsmasq': {'start', 'stop', 'restart', 'enable', 'disable'},
-    'wg-quick@wg0': {'start', 'stop', 'restart', 'enable', 'disable'},
     'apguard': {'start', 'restart', 'enable'},
     'ap-iface': {'start', 'restart', 'enable'},
     'ap2-iface': {'start', 'restart', 'enable'},
@@ -91,8 +85,8 @@ CONTROL_SERVICES = {
 
 LOG_SERVICES = {
     'hostapd', 'hostapd-2g', 'dnsmasq', 'apguard', 'ap-iface', 'ap2-iface',
-    'wg-quick@wg0', 'systemd-networkd',
-    'sbc-control-center-agent', 'sbc-control-center-web',
+    'systemd-networkd',
+    sbc_site.AGENT_UNIT, sbc_site.WEB_UNIT, 'adguardhome',
 }
 
 job_lock = threading.RLock()
@@ -104,7 +98,7 @@ job: dict[str, Any] = {
 
 portal_update_lock = threading.RLock()
 portal_update_state: dict[str, Any] = {
-    'state': 'unconfigured', 'checking': False, 'repo': '', 'current_version': '0.0.1-1',
+    'state': 'unconfigured', 'checking': False, 'repo': '', 'current_version': '2.8.0',
     'latest_version': None, 'release_name': None, 'release_url': None,
     'published_at': None, 'notes': '', 'update_available': False,
     'checked_at': None, 'error': None,
@@ -112,6 +106,7 @@ portal_update_state: dict[str, Any] = {
 
 privilege_lock = threading.RLock()
 privilege_grants: dict[str, dict[str, Any]] = {}
+TERMINAL_MANAGER = terminal_pty.TerminalManager(max_sessions=2, idle_ttl=900, absolute_ttl=3600)
 privilege_failures: dict[str, list[float]] = {}
 privilege_user_failures: dict[str, list[float]] = {}
 telemetry_lock = threading.Lock()
@@ -119,10 +114,30 @@ AGENT_CLIENT_LIMIT = 8
 agent_client_slots = threading.BoundedSemaphore(AGENT_CLIENT_LIMIT)
 
 PRIVILEGED_ACTIONS = {
-    'service', 'update_job', 'wifi_config', 'backup_create', 'reboot', 'poweroff',
-    'portal_update_source', 'logs', 'backup_download', 'network_scan',
-    'packet_capture_start', 'network_fingerprint', 'network_label', 'network_unlabel',
+    'terminal_start', 'service', 'update_job', 'wifi_config', 'backup_create', 'reboot', 'poweroff',
+    'portal_update_source', 'logs', 'backup_download', 'dns_profile', 'packet_start', 'device_label', 'device_unlabel',
+    'device_scan', 'device_fingerprint', 'packet_analysis',
 }
+
+
+
+
+def _valid_packet_capture_scope(intent: dict[str, Any]) -> dict[str, Any] | None:
+    interfaces = intent.get('interfaces')
+    duration = intent.get('duration_seconds', 60)
+    save_pcap = intent.get('save_pcap', False)
+    if not isinstance(interfaces, list) or not interfaces or len(interfaces) > 4:
+        return None
+    if any(not isinstance(name, str) or name not in PACKET_CAPTURE_INTERFACES for name in interfaces):
+        return None
+    if len(set(interfaces)) != len(interfaces):
+        return None
+    if isinstance(duration, bool) or not isinstance(duration, int) or not 10 <= duration <= 600:
+        return None
+    if not isinstance(save_pcap, bool) or (save_pcap and duration > 300):
+        return None
+    return {'action': 'packet_start', 'interfaces': sorted(interfaces),
+            'duration_seconds': duration, 'save_pcap': save_pcap}
 
 
 def configured_sudo_user() -> str:
@@ -145,6 +160,10 @@ def console_requires_privilege(command: Any) -> bool:
         return False
     if parts == ['status']:
         return True
+    if len(parts) == 3 and parts[:2] == ['dns', 'profile'] and parts[2] in dns_filter.PROFILES:
+        return True
+    if parts[:2] == ['devices', 'scan'] or (len(parts) == 3 and parts[:2] == ['devices', 'fingerprint']):
+        return True
     if parts[:1] in (['nft'], ['journalctl']):
         return True
     if parts in (['ss', '-lntup'], ['wg', 'show']):
@@ -166,8 +185,32 @@ def privilege_scope(intent: Any) -> dict[str, Any] | None:
     action = intent.get('action')
     if not isinstance(action, str):
         return None
-    if action in {'reboot', 'poweroff', 'backup_create'}:
+    if action in {'reboot', 'poweroff', 'backup_create', 'terminal_start'}:
         return {'action': action}
+    if action == 'packet_start':
+        return _valid_packet_capture_scope(intent)
+    if action == 'packet_analysis':
+        return {'action': 'packet_analysis'}
+    if action == 'device_scan':
+        interfaces = network_discovery.validate_scan_interfaces(intent.get('interfaces'))
+        return {'action': action, 'interfaces': interfaces} if interfaces else None
+    if action == 'device_fingerprint':
+        scope = network_discovery.fingerprint_scope(intent.get('ip'))
+        return {'action': action, **scope} if scope else None
+    if action in {'device_label', 'device_unlabel'}:
+        mac = device_intelligence.normalize_mac(intent.get('mac'))
+        if not mac or device_intelligence.mac_properties(mac).get('multicast'):
+            return None
+        if action == 'device_unlabel':
+            return {'action': action, 'mac': mac}
+        label = intent.get('label')
+        if not isinstance(label, str):
+            return None
+        label = ''.join(ch for ch in label.strip() if ch >= ' ' and ch not in '\x7f')[:48]
+        return {'action': action, 'mac': mac, 'label': label} if label else None
+    if action == 'dns_profile':
+        profile = intent.get('profile')
+        return {'action': action, 'profile': profile} if isinstance(profile, str) and profile in dns_filter.PROFILES else None
     if action == 'service':
         unit, verb = intent.get('unit'), intent.get('verb')
         if isinstance(unit, str) and isinstance(verb, str) and verb in CONTROL_SERVICES.get(unit, set()):
@@ -203,31 +246,6 @@ def privilege_scope(intent: Any) -> dict[str, Any] | None:
     if action == 'backup_download':
         name = intent.get('name')
         return {'action': action, 'name': name} if isinstance(name, str) and re.fullmatch(r'sbc-control-config-[0-9]{8}T[0-9]{6}Z\.tar\.gz', name) else None
-    if action == 'network_scan':
-        interfaces = network_observability.validate_scan_interfaces(intent.get('interfaces'))
-        return {'action': action, 'interfaces': interfaces} if interfaces else None
-    if action == 'network_fingerprint':
-        return network_observability.fingerprint(req.get('address'))
-    if action == 'packet_capture_start':
-        duration = intent.get('duration_seconds')
-        interfaces = network_observability.validate_capture_interfaces(intent.get('interfaces'))
-        save_pcap = intent.get('save_pcap', False)
-        if isinstance(duration, bool) or not isinstance(duration, int) or not 10 <= duration <= 600:
-            return None
-        if not interfaces or not isinstance(save_pcap, bool) or (save_pcap and duration > 300):
-            return None
-        return {'action': action, 'duration_seconds': duration, 'interfaces': interfaces, 'save_pcap': save_pcap}
-    if action == 'network_fingerprint':
-        address = network_observability.validate_fingerprint_address(intent.get('address'))
-        return {'action': action, 'address': address} if address else None
-    if action in {'network_label', 'network_unlabel'}:
-        mac = intent.get('mac')
-        label = intent.get('label', '')
-        if not isinstance(mac, str) or not re.fullmatch(r'(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}', mac):
-            return None
-        if action == 'network_label' and (not isinstance(label, str) or not label.strip() or len(label) > 64 or any(ord(ch) < 32 for ch in label)):
-            return None
-        return {'action': action, 'mac': mac.lower(), 'label': label.strip() if isinstance(label, str) else ''}
     if action == 'console':
         command = intent.get('command')
         return {'action': action, 'command': command} if isinstance(command, str) and console_requires_privilege(command) else None
@@ -431,7 +449,7 @@ def _portal_update_worker() -> None:
     try:
         request = urllib.request.Request(url, headers={
             'Accept': 'application/vnd.github+json',
-            'User-Agent': 'SBCControlCenter/0.0.1-1',
+            'User-Agent': sbc_site.USER_AGENT,
             'X-GitHub-Api-Version': '2022-11-28',
         })
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoExternalRedirects())
@@ -508,7 +526,7 @@ def portal_update_scheduler() -> None:
 
 
 def run_console_command(command: Any) -> dict[str, Any]:
-    """Execute a fixed set of read-only diagnostics; never invoke a shell."""
+    """Execute fixed diagnostics and explicitly allow-listed DNS profile operations; never invoke a shell."""
     if not isinstance(command, str) or not command.strip() or len(command) > 180 or any(ord(c) < 32 for c in command):
         return {'ok': False, 'error': 'Enter one command of at most 180 characters.'}
     try:
@@ -519,7 +537,7 @@ def run_console_command(command: Any) -> dict[str, Any]:
         return {'ok': False, 'error': 'Command is empty or contains too many arguments.'}
 
     help_text = (
-        'READ-ONLY ADMIN CONSOLE — supported commands\n'
+        'RESTRICTED ADMIN CONSOLE — supported commands\n'
         '  help                         Show this help\n'
         '  version                      Control Center version\n'
         '  status                       AP, VPN and service summary\n'
@@ -540,13 +558,37 @@ def run_console_command(command: Any) -> dict[str, Any]:
         '  ss -lntup                    Listening sockets\n'
         '  systemctl --failed           Failed service units\n'
         '  systemctl status UNIT        Status of an approved service\n'
-        '  journalctl -u UNIT -n 40     Recent logs (1–100 lines)\n\n'
-        'This is a restricted diagnostic console, not a general shell. Commands run as fixed argument arrays without a shell. Pipes, redirection, scripts, arbitrary paths and write commands are disabled.'
+        '  journalctl -u UNIT -n 40     Recent logs (1–100 lines)\n'
+        '  dns status                   AdGuard Home and active filtering profile\n'
+        '  dns profiles                 List available protection profiles\n'
+        '  dns profile NAME             Apply a profile (fresh sudo approval required)\n\n'
+        'This is a restricted allow-listed console, not a general shell. Commands run as fixed argument arrays without a shell. Pipes, redirection, scripts, arbitrary paths and unapproved write commands are disabled.'
     )
     if parts == ['help']:
         return {'ok': True, 'command': command, 'output': help_text}
     if parts == ['version']:
-        return {'ok': True, 'command': command, 'output': f"SBC Control Center {current_app_version()}"}
+        return {'ok': True, 'command': command, 'output': f"{CFG['device_label']} · SBC Control Center {current_app_version()}"}
+    if parts == ['dns', 'status']:
+        try:
+            state = dns_filter.status().get('dns', {})
+            output = (f"AdGuard installed: {'yes' if state.get('installed') else 'no'}\n"
+                      f"Service: {state.get('service_state', 'unknown')}\n"
+                      f"Profile: {state.get('profile', 'not configured')}\n"
+                      f"DNS listeners: {', '.join(state.get('dns_listeners', []))}\n"
+                      f"Upstream: {state.get('upstream', 'unknown')}\n"
+                      f"Firewall source configured: {'yes' if state.get('firewall_rules_file_configured') else 'no'}")
+            return {'ok': True, 'command': command, 'output': output}
+        except Exception as exc:
+            return {'ok': False, 'error': str(exc)}
+    if parts == ['dns', 'profiles']:
+        output = '\n'.join(f"{item['id']}: {item['description']}" for item in dns_filter.available_profiles())
+        return {'ok': True, 'command': command, 'output': output}
+    if len(parts) == 3 and parts[:2] == ['dns', 'profile'] and parts[2] in dns_filter.PROFILES:
+        try:
+            result = dns_filter.apply_profile(parts[2])
+            return {'ok': bool(result.get('ok')), 'command': command, 'output': result.get('message', 'DNS profile applied.'), 'message': result.get('message')}
+        except Exception as exc:
+            return {'ok': False, 'error': str(exc)}
     if parts == ['status']:
         s = get_status()
         services = ', '.join(
@@ -621,32 +663,20 @@ def run_console_command(command: Any) -> dict[str, Any]:
 
 
 def load_config() -> dict[str, Any]:
-    cfg = dict(DEFAULT_CONFIG)
-    try:
-        loaded = json.loads(CONFIG_PATH.read_text())
-        if isinstance(loaded, dict):
-            for key in DEFAULT_CONFIG:
-                if key in loaded and isinstance(loaded[key], str):
-                    cfg[key] = loaded[key]
-    except Exception:
-        pass
-    # These values are identifiers, not shell fragments, but validate anyway.
-    if not re.fullmatch(r'[A-Za-z0-9_.:-]{1,32}', cfg['ap_interface']):
-        cfg['ap_interface'] = DEFAULT_CONFIG['ap_interface']
-    if not re.fullmatch(r'[A-Za-z0-9_.:-]{1,32}', cfg['vpn_interface']):
-        cfg['vpn_interface'] = DEFAULT_CONFIG['vpn_interface']
-    if not re.fullmatch(r'wg-quick@[A-Za-z0-9_.-]{1,32}', cfg['vpn_unit']):
-        cfg['vpn_unit'] = DEFAULT_CONFIG['vpn_unit']
-    return cfg
+    return sbc_site.load(CONFIG_PATH)
 
 
 CFG = load_config()
-try:
-    network_observability.configure(CFG)
-except Exception:
-    pass
-telemetry_sampler = realtime_telemetry.RealtimeSampler(telemetry.snapshot, capacity=900, interval_seconds=1.0)
 
+
+# Resolve capture interfaces only after the validated host configuration exists.
+# The same allowlist is used by the web console and direct SSH/TTY administration.
+PACKET_CAPTURE_INTERFACES = {
+    CFG['ap2_interface']: 'AP · onboard 2.4 GHz',
+    CFG['ap_interface']: f"AP · {CFG['ap_label']}",
+    CFG['vpn_interface']: f"{CFG['vpn_label']} · inner traffic",
+    CFG['uplink_interface']: 'Physical uplink · encrypted WireGuard transport',
+}
 # The configured WireGuard unit is added to fixed service registries only after
 # validating its systemd unit name. No caller-supplied unit reaches systemctl.
 _configured_vpn_unit = CFG['vpn_unit']
@@ -741,11 +771,17 @@ def read_wireless_clients(iface: str, lease_path: str, subnet: str | None = None
                 current.update(lease)
                 clients.append(current)
             mac = line.split()[1].lower()
-            current = {'mac': mac, 'signal': None, 'tx_bitrate': None, 'rx_bytes': None, 'tx_bytes': None, 'associated': True}
+            current = {'mac': mac, 'signal': None, 'tx_bitrate': None, 'rx_bitrate': None, 'rx_bytes': None, 'tx_bytes': None, 'tx_retries': None, 'tx_failed': None, 'associated': True, 'radio': iface, 'discovery_source': 'Wi-Fi station table'}
         elif current and line.startswith('signal:'):
             current['signal'] = line.split(':', 1)[1].strip()
         elif current and line.startswith('tx bitrate:'):
             current['tx_bitrate'] = line.split(':', 1)[1].strip()
+        elif current and line.startswith('rx bitrate:'):
+            current['rx_bitrate'] = line.split(':', 1)[1].strip()
+        elif current and line.startswith('tx retries:'):
+            current['tx_retries'] = line.split(':', 1)[1].strip()
+        elif current and line.startswith('tx failed:'):
+            current['tx_failed'] = line.split(':', 1)[1].strip()
         elif current and line.startswith('rx bytes:'):
             current['rx_bytes'] = line.split(':', 1)[1].strip()
         elif current and line.startswith('tx bytes:'):
@@ -757,7 +793,7 @@ def read_wireless_clients(iface: str, lease_path: str, subnet: str | None = None
     associated = {c['mac'] for c in clients}
     for mac, lease in leases.items():
         if mac not in associated:
-            clients.append({**lease, 'associated': False, 'signal': None, 'tx_bitrate': None})
+            clients.append({**lease, 'associated': False, 'signal': None, 'tx_bitrate': None, 'radio': iface, 'discovery_source': 'dnsmasq DHCP lease'})
         else:
             next(c for c in clients if c['mac'] == mac)['associated'] = True
     return clients
@@ -985,7 +1021,7 @@ def update_hostapd_config(req: dict[str, Any]) -> dict[str, Any]:
 def create_backup() -> dict[str, Any]:
     backup_dir = STATE / 'backups'
     try:
-        portal_gid = grp.getgrnam('sbc-control-center').gr_gid
+        portal_gid = grp.getgrnam(sbc_site.PORTAL_GROUP).gr_gid
     except KeyError:
         portal_gid = os.getegid()
     backup_dir.mkdir(mode=0o750, parents=True, exist_ok=True)
@@ -1089,8 +1125,17 @@ def get_status() -> dict[str, Any]:
     ap_info = run_cmd(['/usr/sbin/iw', 'dev', CFG['ap_interface'], 'info'])
     if ap_info['rc'] != 0:
         ap_info = run_cmd(['/usr/bin/iw', 'dev', CFG['ap_interface'], 'info'])
-    clients = read_wireless_clients(CFG['ap_interface'], CFG['dhcp_lease_file'], CFG['ap_subnet'])
-    clients2 = read_wireless_clients(CFG['ap2_interface'], CFG['dhcp_lease_file'], CFG['ap2_subnet'])
+    neighbours5 = device_intelligence.discover_neighbours(CFG['ap_interface'], CFG['ap_subnet'])
+    neighbours5.extend(network_discovery.cached_scan_results(CFG['ap_interface']))
+    neighbours2 = device_intelligence.discover_neighbours(CFG['ap2_interface'], CFG['ap2_subnet'])
+    neighbours2.extend(network_discovery.cached_scan_results(CFG['ap2_interface']))
+    passive_fingerprints = network_discovery.passive_os_fingerprints()
+    clients = device_intelligence.enrich_clients(
+        read_wireless_clients(CFG['ap_interface'], CFG['dhcp_lease_file'], CFG['ap_subnet']),
+        neighbours=neighbours5, passive_fingerprints=passive_fingerprints)
+    clients2 = device_intelligence.enrich_clients(
+        read_wireless_clients(CFG['ap2_interface'], CFG['dhcp_lease_file'], CFG['ap2_subnet']),
+        neighbours=neighbours2, passive_fingerprints=passive_fingerprints)
     ap5_cfg = read_hostapd_config('/etc/hostapd/hostapd.conf', CFG['ap_interface'], CFG['ap_ssid'])
     ap2_cfg = read_hostapd_config('/etc/hostapd/hostapd-2g.conf', CFG['ap2_interface'], CFG['ap2_ssid'])
     # Firewall rules can reveal sensitive policy and are deliberately not read
@@ -1121,11 +1166,11 @@ def get_status() -> dict[str, Any]:
                'ip': CFG['ap_ip'], 'subnet': CFG['ap_subnet'],
                'radio_info': ap_info.get('out', ''), 'clients': clients},
         'aps': [
-            {'id': 'radio5', 'label': 'SBC-5G · 5 GHz', 'interface': CFG['ap_interface'],
+            {'id': 'radio5', 'label': f"{ap5_cfg.get('ssid') or CFG['ap_ssid']} · {CFG['ap_label']}", 'interface': CFG['ap_interface'],
              'ip': CFG['ap_ip'], 'subnet': CFG['ap_subnet'], 'service': 'hostapd',
              'radio_info': ap_info.get('out', ''), 'active': service_active.get('hostapd', False), 'clients': clients, 'config': ap5_cfg,
              'counters': read_net_counters(CFG['ap_interface'])},
-            {'id': 'radio2', 'label': 'SBC-2G · 2.4 GHz', 'interface': CFG['ap2_interface'],
+            {'id': 'radio2', 'label': f"{ap2_cfg.get('ssid') or CFG['ap2_ssid']} · {CFG['ap2_label']}", 'interface': CFG['ap2_interface'],
              'ip': CFG['ap2_ip'], 'subnet': CFG['ap2_subnet'], 'service': 'hostapd-2g',
              'radio_info': iw_info(CFG['ap2_interface']), 'active': service_active.get('hostapd-2g', False),
              'clients': clients2, 'config': ap2_cfg, 'counters': read_net_counters(CFG['ap2_interface'])},
@@ -1138,6 +1183,7 @@ def get_status() -> dict[str, Any]:
         'firewall_loaded': firewall_loaded,
         'vpn_routes': routes.get('out', ''), 'ip_rules': rules.get('out', ''),
         'job': get_job(),
+        'device_discovery': network_discovery.tool_inventory(),
     }
 
 
@@ -1215,7 +1261,7 @@ def execute_package_command(args: list[str], timeout: int) -> int:
     if not isinstance(args, list) or tuple(args) not in allowed:
         append_job_log('\n[Control Center] Package command rejected.\n')
         return 2
-    unit = 'kickpi-control-apt-' + uuid.uuid4().hex
+    unit = f'{sbc_site.NAME}-apt-' + uuid.uuid4().hex
     command = [
         '/usr/bin/systemd-run', '--wait', '--collect', '--pipe', '--quiet',
         '--service-type=exec', f'--unit={unit}',
@@ -1272,7 +1318,7 @@ def start_job(kind: str) -> dict[str, Any]:
         return {'ok': True, 'job': dict(job)}
 
 
-def do_action(req: dict[str, Any]) -> dict[str, Any]:
+def do_action(req: dict[str, Any], trusted_root_peer: bool = False) -> dict[str, Any]:
     action = req.get('action')
     if action == 'privilege_info':
         username = configured_sudo_user()
@@ -1280,61 +1326,144 @@ def do_action(req: dict[str, Any]) -> dict[str, Any]:
     if action == 'privilege_authorize':
         return authorize_privileged_session(req)
     needs_privilege = action in PRIVILEGED_ACTIONS or (action == 'console' and console_requires_privilege(req.get('command')))
-    if needs_privilege and not consume_privilege_grant(req):
+    if needs_privilege and not trusted_root_peer and not consume_privilege_grant(req):
         return {'ok': False, 'error': 'Fresh Linux sudo-password verification is required for this operation.'}
     if action == 'status':
         return {'ok': True, 'data': get_status()}
     if action == 'telemetry':
+        with telemetry_lock:
+            return {'ok': True, 'telemetry': telemetry.snapshot()}
+    if action == 'terminal_start':
+        owner = req.get('session_id')
+        actor = configured_sudo_user() or 'administrator'
+        client_ip = req.get('client_ip', 'unknown')
+        if not isinstance(client_ip, str) or not re.fullmatch(r'[0-9A-Fa-f:.]{1,64}', client_ip):
+            client_ip = 'unknown'
         try:
-            return {'ok': True, 'telemetry': telemetry_sampler.read(
-                after_sequence=req.get('after_sequence', 0), limit=req.get('limit', 900))}
-        except (TypeError, ValueError) as exc:
+            started = TERMINAL_MANAGER.start(owner, actor=actor, client_ip=client_ip,
+                                             rows=req.get('rows', 28), cols=req.get('cols', 100))
+            print(f"[TERMINAL] event=start actor={actor} client={client_ip} session={hashlib.sha256(owner.encode()).hexdigest()[:12]} terminal={hashlib.sha256(started['terminal_id'].encode()).hexdigest()[:12]}", flush=True)
+            return {'ok': True, **started}
+        except (terminal_pty.TerminalError, OSError) as exc:
+            return {'ok': False, 'error': str(exc)[:512]}
+    if action == 'terminal_attach':
+        try:
+            return {'ok': True, **TERMINAL_MANAGER.attach(req.get('session_id'), req.get('terminal_id'))}
+        except terminal_pty.TerminalError as exc:
             return {'ok': False, 'error': str(exc)}
-    if action == 'network_inventory':
+    if action == 'terminal_input':
+        encoded = req.get('data_b64')
+        if not isinstance(encoded, str) or len(encoded) > 11000:
+            return {'ok': False, 'error': 'Terminal input is invalid or too large.'}
         try:
-            return {'ok': True, 'network': network_observability.inventory()}
-        except Exception as exc:
-            return {'ok': False, 'error': str(exc)[:240]}
-    if action == 'network_scan':
-        return network_observability.scan(req.get('interfaces'))
-    if action == 'packet_capture_start':
+            data = base64.b64decode(encoded, validate=True)
+            written = TERMINAL_MANAGER.write(req.get('session_id'), req.get('terminal_id'), data)
+            return {'ok': True, 'written': written}
+        except (ValueError, terminal_pty.TerminalError, OSError) as exc:
+            return {'ok': False, 'error': str(exc)[:512]}
+    if action == 'terminal_resize':
         try:
-            return network_observability.capture_start(req.get('duration_seconds'), req.get('interfaces'), req.get('save_pcap', False))
-        except Exception as exc:
-            return {'ok': False, 'error': str(exc)[:240]}
-    if action == 'packet_capture_stop':
+            TERMINAL_MANAGER.resize(req.get('session_id'), req.get('terminal_id'),
+                                    req.get('rows'), req.get('cols'))
+            return {'ok': True}
+        except (terminal_pty.TerminalError, OSError) as exc:
+            return {'ok': False, 'error': str(exc)[:512]}
+    if action == 'terminal_read':
         try:
-            return network_observability.capture_stop()
-        except Exception as exc:
-            return {'ok': False, 'error': str(exc)[:240]}
-    if action == 'packet_capture_snapshot':
+            output = TERMINAL_MANAGER.read(req.get('session_id'), req.get('terminal_id'),
+                                           req.get('max_bytes', 8192))
+            return {'ok': True, 'data_b64': base64.b64encode(output['data']).decode('ascii'),
+                    'running': output['running'], 'exit_code': output['exit_code']}
+        except (terminal_pty.TerminalError, OSError) as exc:
+            return {'ok': False, 'error': str(exc)[:512]}
+    if action == 'terminal_close':
+        closed = TERMINAL_MANAGER.close(req.get('session_id'), req.get('terminal_id'))
+        return {'ok': True, 'closed': closed}
+    if action == 'terminal_close_session':
+        closed = TERMINAL_MANAGER.close_owner(req.get('session_id'), 'portal session ended')
+        return {'ok': True, 'closed': closed}
+    if action == 'packet_tools':
+        return packet_analysis.tool_inventory()
+    if action == 'packet_analysis':
+        snap = packet_monitor.capture_manager.snapshot(after=0, limit=0)
+        capture = snap.get('capture') or {}
+        if capture.get('active'):
+            return {'ok': False, 'error': 'Wait for the bounded capture to finish before running TShark analysis.'}
+        return packet_analysis.analyse_capture(capture.get('pcapng_path'))
+    if action == 'packet_snapshot':
+        after = req.get('after', 0)
+        limit = req.get('limit', 120)
+        series_id = req.get('series_id')
+        if isinstance(after, bool) or not isinstance(after, int) or after < 0:
+            after = 0
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 0 <= limit <= 250:
+            limit = 120
+        if not isinstance(series_id, str) or len(series_id) > 64:
+            series_id = None
+        return packet_monitor.capture_manager.snapshot(after=after, limit=limit, series_id=series_id)
+    if action == 'packet_start':
+        scope = _valid_packet_capture_scope(req)
+        if not scope:
+            return {'ok': False, 'error': 'Invalid packet-capture scope. Choose approved interfaces, 10–600 seconds, and at most 300 seconds for PCAPNG.'}
         try:
-            after, limit = req.get('after', 0), req.get('limit', 200)
-            if isinstance(after, bool) or not isinstance(after, int) or after < 0 or isinstance(limit, bool) or not isinstance(limit, int) or not 0 <= limit <= 250:
-                return {'ok': False, 'error': 'Invalid packet event cursor or limit.'}
-            return network_observability.capture_snapshot(after, limit)
+            return packet_monitor.capture_manager.start(
+                scope['duration_seconds'], scope['interfaces'],
+                allowed_interfaces=PACKET_CAPTURE_INTERFACES,
+                subnets=(CFG['ap2_subnet'], CFG['ap_subnet']),
+                save_pcap=scope['save_pcap'])
         except Exception as exc:
-            return {'ok': False, 'error': str(exc)[:240]}
-    if action == 'packet_flow_series':
-        flow_id, limit = req.get('flow_id'), req.get('limit', 60)
-        if not isinstance(flow_id, str) or not re.fullmatch(r'[0-9a-f]{24}', flow_id):
-            return {'ok': False, 'error': 'Invalid flow identifier.'}
-        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 60:
-            return {'ok': False, 'error': 'Invalid flow history limit.'}
+            return {'ok': False, 'error': str(exc)}
+    if action == 'packet_stop':
+        return packet_monitor.capture_manager.stop()
+    if action == 'adapter_status':
         try:
-            return network_observability.flow_series(flow_id, limit)
+            return {'ok': True, 'wireless': wireless_adapter.status(),
+                    'interfaces': packet_monitor.adapter_inventory(PACKET_CAPTURE_INTERFACES)}
         except Exception as exc:
-            return {'ok': False, 'error': str(exc)[:240]}
-    if action == 'packet_analyse':
-        return network_observability.analyse_capture(req.get('name'))
+            return {'ok': False, 'error': str(exc)}
+    if action == 'device_discovery_events':
+        try:
+            limit = req.get('limit', 20)
+            return network_discovery.recent_arpwatch_events(limit)
+        except Exception as exc:
+            return {'ok': False, 'error': str(exc)}
+    if action == 'device_scan':
+        scope = privilege_scope(req)
+        if not scope:
+            return {'ok': False, 'error': 'Device scan scope is invalid or outside the configured Wi-Fi networks.'}
+        try:
+            result = network_discovery.scan_configured_networks(scope['interfaces'])
+            return result
+        except Exception as exc:
+            return {'ok': False, 'error': str(exc)}
+    if action == 'device_fingerprint':
+        scope = privilege_scope(req)
+        if not scope:
+            return {'ok': False, 'error': 'Nmap fingerprint target is invalid or outside the configured Wi-Fi networks.'}
+        try:
+            return network_discovery.fingerprint_device(scope['ip'])
+        except Exception as exc:
+            return {'ok': False, 'error': str(exc)}
+    if action == 'device_label':
+        try:
+            return device_intelligence.set_label(req.get('mac'), req.get('label'))
+        except Exception as exc:
+            return {'ok': False, 'error': str(exc)}
+    if action == 'device_unlabel':
+        try:
+            return device_intelligence.remove_label(req.get('mac'))
+        except Exception as exc:
+            return {'ok': False, 'error': str(exc)}
     if action == 'dns_status':
-        return network_observability.dns_status()
-    if action == 'dns_query_log':
-        return network_observability.dns_query_log(req.get('limit', 50))
-    if action == 'network_label':
-        return network_observability.set_client_label(req.get('mac'), req.get('label'))
-    if action == 'network_unlabel':
-        return network_observability.remove_client_label(req.get('mac'))
+        try:
+            return dns_filter.status()
+        except Exception as exc:
+            return {'ok': False, 'error': str(exc)}
+    if action == 'dns_profile':
+        try:
+            return dns_filter.apply_profile(req.get('profile'))
+        except Exception as exc:
+            return {'ok': False, 'error': str(exc)}
     if action == 'job_status':
         return {'ok': True, 'job': get_job()}
     if action == 'portal_update_status':
@@ -1390,21 +1519,28 @@ def do_action(req: dict[str, Any]) -> dict[str, Any]:
     return {'ok': False, 'error': 'Unknown operation.'}
 
 
-def agent_peer_allowed(conn: socket.socket) -> bool:
-    """Only accept the dedicated unprivileged portal identity over the local socket."""
+def agent_peer_uid(conn: socket.socket) -> int | None:
+    """Return the Unix peer UID only for root or the dedicated portal account."""
     if not hasattr(socket, 'SO_PEERCRED'):
-        return False
+        return None
     try:
         _pid, uid, _gid = struct.unpack('3i', conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
-        portal_uid = pwd.getpwnam('sbc-control-center').pw_uid
-        return uid == portal_uid and portal_uid != 0
+        if uid == 0:
+            return 0
+        portal_uid = pwd.getpwnam(sbc_site.PORTAL_USER).pw_uid
+        return uid if portal_uid != 0 and uid == portal_uid else None
     except Exception:
-        return False
+        return None
+
+
+def agent_peer_allowed(conn: socket.socket) -> bool:
+    return agent_peer_uid(conn) is not None
 
 
 def handle_client(conn: socket.socket) -> None:
     try:
-        if not agent_peer_allowed(conn):
+        peer_uid = agent_peer_uid(conn)
+        if peer_uid is None:
             conn.sendall(b'{"ok":false,"error":"Agent peer credentials rejected."}\n')
             return
         conn.settimeout(10)
@@ -1426,7 +1562,7 @@ def handle_client(conn: socket.socket) -> None:
             if not isinstance(request, dict):
                 response = {'ok': False, 'error': 'Invalid request format.'}
             else:
-                response = do_action(request)
+                response = do_action(request, trusted_root_peer=(peer_uid == 0))
         conn.sendall((json.dumps(response, separators=(',', ':')) + '\n').encode())
     except Exception as exc:
         try:
@@ -1438,8 +1574,16 @@ def handle_client(conn: socket.socket) -> None:
 
 
 def main() -> None:
-    telemetry_sampler.start()
     threading.Thread(target=portal_update_scheduler, daemon=True, name='portal-update-scheduler').start()
+    def terminal_reaper() -> None:
+        while True:
+            time.sleep(30)
+            try:
+                TERMINAL_MANAGER.reap_expired()
+                # TerminalManager logs each expired session without recording I/O.
+            except Exception as exc:
+                print(f'[TERMINAL] reaper-error type={type(exc).__name__}', flush=True)
+    threading.Thread(target=terminal_reaper, daemon=True, name='terminal-reaper').start()
     SOCKET_DIR.mkdir(mode=0o750, parents=True, exist_ok=True)
     try:
         SOCKET_PATH.unlink()
@@ -1452,7 +1596,7 @@ def main() -> None:
     # systemd creates the runtime directory with the portal group.
     try:
         import grp
-        os.chown(SOCKET_PATH, 0, grp.getgrnam('sbc-control-center').gr_gid)
+        os.chown(SOCKET_PATH, 0, grp.getgrnam(sbc_site.PORTAL_GROUP).gr_gid)
     except Exception:
         pass
     server.listen(16)
