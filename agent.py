@@ -76,6 +76,7 @@ SERVICE_LABELS = {
     sbc_site.WEB_UNIT: 'Control Center web portal',
     'adguardhome': 'DNS filtering service',
     packet_history.UNIT: '24-hour packet history recorder',
+    'suricata': 'Intrusion detection (Suricata, ET Open rules)',
 }
 
 # The web portal cannot send arbitrary unit names or command arguments.
@@ -87,12 +88,13 @@ CONTROL_SERVICES = {
     'ap-iface': {'start', 'restart', 'enable'},
     'ap2-iface': {'start', 'restart', 'enable'},
     packet_history.UNIT: {'start', 'stop', 'restart', 'enable', 'disable'},
+    'suricata': {'start', 'stop', 'restart', 'enable', 'disable'},
 }
 
 LOG_SERVICES = {
     'hostapd', 'hostapd-2g', 'dnsmasq', 'apguard', 'ap-iface', 'ap2-iface',
     'systemd-networkd',
-    sbc_site.AGENT_UNIT, sbc_site.WEB_UNIT, 'adguardhome', packet_history.UNIT,
+    sbc_site.AGENT_UNIT, sbc_site.WEB_UNIT, 'adguardhome', packet_history.UNIT, 'suricata',
 }
 
 job_lock = threading.RLock()

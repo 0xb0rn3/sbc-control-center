@@ -408,7 +408,9 @@ pre { max-height: 430px; margin: 0; padding: 12px; overflow: auto; border: 1px s
 .live-legend label{display:flex;align-items:center;gap:6px}
 .live-legend input{width:12px;height:12px;accent-color:var(--accent)}
 .lg{display:inline-block;width:8px;height:8px;border-radius:50%}.lg.conn{background:#7dbed6}.lg.glob{background:#e8965a}.lg.hit{background:#e8685a}.lg.dns{background:#8ca9b5}
-.live-h{margin:0 0 8px;font-size:12px}
+.live-h{margin:0 0 8px;font-size:12px;display:flex;align-items:center;gap:8px}
+.live-ids path{fill:#ff5a4a;stroke:#2a0c0a;stroke-width:1}
+.lg.ids{background:#ff5a4a;border-radius:1px;transform:rotate(45deg)}
 .live-table{max-height:300px}
 .live-table tr.hit td{color:#f0a89c}
 /* VPN servers */
@@ -802,16 +804,18 @@ Type help to list the available commands. DNS commands: dns status, dns profiles
               <g id="liveMapArcs" class="live-arcs"></g>
               <g id="liveMapGlobal" class="live-global"></g>
               <g id="liveMapConns" class="live-conns"></g>
+              <g id="liveMapIds" class="live-ids"></g>
               <g id="liveMapHome"></g>
               <g id="threatMapMarkers" class="map-markers"></g>
             </svg>
             <div class="map-empty" id="threatMapEmpty">Waiting for geolocated endpoint observations. Install a local GeoLite2 City database to enable geographic markers.</div>
-            <div class="live-legend"><label><input type="checkbox" id="liveShowConns" checked> <i class="lg conn"></i>Your connections</label><label><input type="checkbox" id="liveShowGlobal" checked> <i class="lg glob"></i>Global threat activity</label><label><i class="lg hit"></i>Feed match</label><label><i class="lg dns"></i>DNS-bypass event</label></div>
+            <div class="live-legend"><label><input type="checkbox" id="liveShowConns" checked> <i class="lg conn"></i>Your connections</label><label><input type="checkbox" id="liveShowGlobal" checked> <i class="lg glob"></i>Global threat activity</label><label><i class="lg hit"></i>Feed match</label><label><input type="checkbox" id="liveShowIds" checked> <i class="lg ids"></i>Intrusion alert</label><label><i class="lg dns"></i>DNS-bypass event</label></div>
           </div>
           <div class="map-foot"><span id="threatMapStatus">No map data yet</span><span id="liveMapFeeds">Local GeoIP only · no remote lookups</span></div>
           <div class="grid two" style="margin-top:12px">
             <div><h4 class="live-h">Live connections</h4><div class="tablewrap live-table"><table class="compact"><thead><tr><th>Destination</th><th>Place</th><th>Devices</th><th>Ports</th></tr></thead><tbody id="liveConnRows"><tr><td colspan="4">Loading…</td></tr></tbody></table></div></div>
-            <div><h4 class="live-h">Threat feeds</h4><div class="tablewrap"><table class="compact"><thead><tr><th>Feed</th><th>Entries</th><th>Updated</th></tr></thead><tbody id="liveFeedRows"><tr><td colspan="3">Loading…</td></tr></tbody></table></div></div>
+            <div><h4 class="live-h">Intrusion detection <span class="pill" id="idsState">—</span></h4><div class="tablewrap live-table"><table class="compact"><thead><tr><th>When</th><th>Alert</th><th>Device</th><th>Remote</th></tr></thead><tbody id="idsRows"><tr><td colspan="4">Loading…</td></tr></tbody></table></div>
+            <h4 class="live-h" style="margin-top:12px">Threat feeds</h4><div class="tablewrap"><table class="compact"><thead><tr><th>Feed</th><th>Entries</th><th>Updated</th></tr></thead><tbody id="liveFeedRows"><tr><td colspan="3">Loading…</td></tr></tbody></table></div></div>
           </div>
         </div>
         <div class="card threat-timeline-card" style="margin-top:12px">
@@ -1731,6 +1735,10 @@ async function refreshLiveMap(){
   let homeSvg='';if(home)homeSvg+=`<circle cx="${home.x}" cy="${home.y}" r="5" fill="#f0b9a5" stroke="#fff" stroke-width="1.5"><title>${vpnEsc(d.home.label)}</title></circle>`;
   if(exit)homeSvg+=`<circle cx="${exit.x}" cy="${exit.y}" r="5" fill="#0e1820" stroke="#f0b9a5" stroke-width="2"><title>VPN exit · ${vpnEsc(d.exit.city)} · ${vpnEsc(d.exit.hostname||d.exit.ip)}</title></circle>`;
   $('liveMapHome').innerHTML=homeSvg;
+  const ids=d.ids||{},alerts=ids.alerts||[];
+  $('liveMapIds').innerHTML=$('liveShowIds').checked?alerts.filter(a=>a.geo).map(a=>{const p=liveXY(a.geo.lat,a.geo.lon);return `<path d="M${p.x.toFixed(1)} ${(p.y-5).toFixed(1)}L${(p.x+5).toFixed(1)} ${p.y.toFixed(1)}L${p.x.toFixed(1)} ${(p.y+5).toFixed(1)}L${(p.x-5).toFixed(1)} ${p.y.toFixed(1)}Z"><title>${vpnEsc(a.signature)} · ${vpnEsc(a.remote)} · ${vpnEsc(a.device||'')}</title></path>`;}).join(''):'';
+  $('idsState').textContent=ids.running?`Watching · ${(ids.rules_enabled||0).toLocaleString()} rules`:'Not running';$('idsState').className='pill '+(ids.running?'ok':'bad');
+  $('idsRows').innerHTML=alerts.slice(0,40).map(a=>`<tr><td>${vpnAgo(a.time)}</td><td>${vpnEsc(a.signature)}<small> · ${vpnEsc(a.category||'')}</small></td><td>${vpnEsc(a.device||'—')}</td><td class="mono">${vpnEsc(a.remote||'—')}${a.geo?` ${vpnFlag(a.geo.cc)}`:''}</td></tr>`).join('')||`<tr><td colspan="4">${ids.running?'No alerts in the last 24 hours.':'Suricata is not running.'}</td></tr>`;
   const conns=d.connections||[],matches=d.matches||[];
   if(conns.length||(d.global||[]).length)$('threatMapEmpty').classList.add('hidden');
   $('threatMapStatus').textContent=`${conns.length} live destination(s) · ${matches.length} feed match(es) · ${(d.global||[]).length} global threat point(s) · updated ${new Date(d.generated*1000).toLocaleTimeString()}`;
@@ -1739,7 +1747,7 @@ async function refreshLiveMap(){
   $('liveMapFeeds').textContent='Local GeoIP · feeds fetched through the VPN tunnel';
 }
 function startLiveMap(){clearInterval(liveMapTimer);refreshLiveMap();liveMapTimer=setInterval(()=>{if(document.visibilityState!=='hidden'&&currentSection==='security-operations'&&!standbyActive)refreshLiveMap();},5000);}
-['liveShowConns','liveShowGlobal'].forEach(id=>$(id).addEventListener('change',refreshLiveMap));
+['liveShowConns','liveShowGlobal','liveShowIds'].forEach(id=>$(id).addEventListener('change',refreshLiveMap));
 function fmtRate(bytes){return `${fmtBytes(bytes)}/s`;}
 function drawLineChart(canvasId,series,maximum=null){
   const canvas=$(canvasId);if(!canvas)return;const rect=canvas.getBoundingClientRect();if(rect.width<20)return;

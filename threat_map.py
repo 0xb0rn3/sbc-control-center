@@ -40,7 +40,13 @@ FEEDS = {
     'feodo': ('https://feodotracker.abuse.ch/downloads/ipblocklist.json', 'abuse.ch Feodo Tracker: botnet command servers'),
     'drop': ('https://www.spamhaus.org/drop/drop_v4.json', 'Spamhaus DROP: hijacked networks'),
     'blocklist_de': ('https://lists.blocklist.de/lists/all.txt', 'blocklist.de: addresses reported for attacks, 48 h'),
+    'urlhaus_domains': ('https://malware-filter.gitlab.io/malware-filter/urlhaus-filter-domains.txt', 'malware-filter: URLhaus malware hosts'),
+    'phishing_domains': ('https://malware-filter.gitlab.io/malware-filter/phishing-filter-domains.txt', 'malware-filter: phishing hosts'),
 }
+REPUTATION_PATH = sbc_site.STATE_DIR / 'threat-intel' / 'reputation.json'
+REPUTATION_MAX_CIDRS = 20000     # the limits threat_intelligence reads
+REPUTATION_MAX_DOMAINS = 50000
+_DOMAIN = re.compile(r'(?=.{3,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}')
 _lock = threading.Lock()
 _reader = None
 _feeds: dict[str, Any] = {'ips': {}, 'nets': [], 'points': [], 'state': {}}
@@ -151,7 +157,41 @@ def _parse(name: str, raw: bytes) -> dict[str, Any]:
         return {'nets': [str(n) for n in nets]}
     if name == 'blocklist_de':
         return {'ips': [ip for line in raw.decode('utf-8', 'replace').splitlines()[:200000] if (ip := _public_ip(line))]}
+    if name in ('urlhaus_domains', 'phishing_domains'):
+        domains = []
+        for line in raw.decode('utf-8', 'replace').splitlines()[:200000]:
+            value = line.strip().lower().rstrip('.')
+            if value and not value.startswith(('#', '!')) and _DOMAIN.fullmatch(value):
+                domains.append(value)
+        return {'domains': domains}
     return {}
+
+
+def build_reputation() -> dict[str, Any]:
+    """The reputation file the threat-intelligence view reads: networks and domains from the feeds."""
+    cidrs: list[str] = []
+    domains: list[str] = []
+    sources = {}
+    for name in ('drop', 'feodo', 'dshield', 'blocklist_de', 'urlhaus_domains', 'phishing_domains'):
+        try:
+            data = json.loads((FEED_DIR / f'{name}.json').read_text())
+        except (OSError, ValueError):
+            continue
+        before = (len(cidrs), len(domains))
+        cidrs += data.get('nets', [])
+        cidrs += [f"{p['ip']}/32" for p in data.get('points', [])]
+        cidrs += [f'{ip}/32' for ip in data.get('ips', [])]
+        domains += data.get('domains', [])
+        sources[name] = {'fetched': data.get('fetched'), 'cidrs': len(cidrs) - before[0], 'domains': len(domains) - before[1]}
+    cidrs = list(dict.fromkeys(cidrs))[:REPUTATION_MAX_CIDRS]      # the most specific sources come first
+    domains = list(dict.fromkeys(domains))[:REPUTATION_MAX_DOMAINS]
+    doc = {'generated': int(time.time()), 'sources': sources, 'cidrs': cidrs, 'domains': domains}
+    REPUTATION_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = REPUTATION_PATH.with_suffix('.tmp')
+    tmp.write_text(json.dumps(doc, separators=(',', ':')))
+    os.chmod(tmp, 0o640)
+    os.replace(tmp, REPUTATION_PATH)
+    return {'cidrs': len(cidrs), 'domains': len(domains)}
 
 
 def refresh_feeds(force: bool = False) -> dict[str, Any]:
@@ -176,6 +216,8 @@ def refresh_feeds(force: bool = False) -> dict[str, Any]:
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
         report[name] = 'updated'
+    if report or not REPUTATION_PATH.exists():
+        report['reputation'] = build_reputation()
     _load_feeds(force=True)
     return report
 
@@ -205,6 +247,7 @@ def _load_feeds(force: bool = False) -> None:
             for ip in data.get('ips', []):
                 ips.setdefault(ip, []).append(name)
                 entries += 1
+            entries += len(data.get('domains', []))
             for cidr in data.get('nets', []):
                 net = ipaddress.ip_network(cidr)
                 nets.append((int(net.network_address), int(net.broadcast_address), name))
@@ -292,11 +335,25 @@ def snapshot() -> dict[str, Any]:
         if geo:
             exit_point = {**geo, 'ip': exit_now['ip'], 'hostname': exit_now.get('hostname', '')}
     conns = connections()
+    ids_state: dict[str, Any] = {'running': False, 'alerts': []}
+    try:
+        import ids
+        ids_state = ids.status()
+        subnets = [ipaddress.ip_network(s) for s in sbc_site.ap_subnets(SITE)]
+        for a in ids_state['alerts']:
+            # place the alert at its outside end: the remote address, whichever side it is on
+            remote = next((ip for ip in (a.get('dest_ip'), a.get('src_ip')) if ip and _public_ip(ip)), None)
+            a['remote'] = remote
+            a['geo'] = locate(remote) if remote else None
+            local = next((ip for ip in (a.get('src_ip'), a.get('dest_ip')) if ip and any(ipaddress.ip_address(ip) in n for n in subnets if ':' not in ip)), None)
+            a['device'] = _client_names().get(local, local)
+    except Exception as exc:
+        ids_state = {'running': False, 'alerts': [], 'error': str(exc)[:200]}
     return {
         'ok': True, 'generated': int(time.time()), 'home': home(), 'exit': exit_point,
         'connections': conns, 'matches': [c for c in conns if c['feeds']],
         'global': _feeds['points'][:1200], 'feeds': _feeds['state'],
-        'geoip': bool(_geo_reader()),
+        'geoip': bool(_geo_reader()), 'ids': ids_state,
     }
 
 
