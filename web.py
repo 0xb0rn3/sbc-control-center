@@ -1042,7 +1042,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        if path == '/standby':
+        if path in ('/standby', '/living-room'):
             try:
                 body = STANDBY_PATH.read_bytes()
             except OSError:

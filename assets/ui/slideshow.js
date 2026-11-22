@@ -9,19 +9,32 @@
  *   show.start(); show.setInterval(30000); show.next(); show.stop();
  *
  * Two layers cross-fade; the next picture is fully downloaded and decoded before it is shown,
- * so a slow TV browser never flashes a half-drawn image. Order is shuffled once per pass and
- * remembered per browser, so a reload does not restart at the same picture.
+ * so a slow TV browser never flashes a half-drawn image. As on the ArxOS lock screen, the
+ * picture follows the clock: the order is a fixed shuffle of the list and the slot is the
+ * current time divided by the interval, so every screen with the same interval shows the same
+ * picture at the same moment, and a reload carries on where the slideshow is.
  */
 (function () {
   'use strict';
   var FALLBACK = ['/assets/ui-background.png'];
-  var STORE = 'sbc-slideshow-pos';
 
-  function shuffle(list) {
-    var a = list.slice();
+  // the same shuffle on every screen: seeded from the list itself
+  function seededShuffle(list) {
+    var seed = 2166136261;
+    for (var k = 0; k < list.length; k++) {
+      for (var c = 0; c < list[k].length; c++) { seed ^= list[k].charCodeAt(c); seed = Math.imul(seed, 16777619) >>> 0; }
+    }
+    function rand() {
+      seed = (seed + 0x6D2B79F5) >>> 0;
+      var t = seed;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    }
+    var a = list.slice().sort();
     for (var i = a.length - 1; i > 0; i--) {
-      var j = Math.floor(Math.random() * (i + 1));
-      var t = a[i]; a[i] = a[j]; a[j] = t;
+      var j = Math.floor(rand() * (i + 1));
+      var x = a[i]; a[i] = a[j]; a[j] = x;
     }
     return a;
   }
@@ -44,7 +57,8 @@
     this.interval = Math.max(5000, options.interval || 300000);
     this.list = [];
     this.order = [];
-    this.pos = 0;
+    this.slot = -1;
+    this.offset = 0;
     this.timer = null;
     this.busy = false;
     this.layers = [document.createElement('div'), document.createElement('div')];
@@ -65,11 +79,7 @@
         self.list = images.filter(function (n) { return /^[A-Za-z0-9][A-Za-z0-9_.-]{0,120}\.(jpe?g|webp|png)$/.test(n); })
           .map(function (n) { return '/assets/wallpapers/' + n; });
         if (!self.list.length) self.list = FALLBACK.slice();
-        self.order = shuffle(self.list);
-        try {
-          var saved = parseInt(localStorage.getItem(STORE) || '0', 10);
-          self.pos = isFinite(saved) ? saved % self.order.length : 0;
-        } catch (e) { self.pos = 0; }
+        self.order = seededShuffle(self.list);
         return self.list.length;
       });
   };
@@ -83,28 +93,38 @@
     this.front = 1 - this.front;
   };
 
-  SbcSlideshow.prototype.next = function () {
+  SbcSlideshow.prototype.currentSlot = function () {
+    return Math.floor(Date.now() / this.interval);
+  };
+
+  // show the picture for the current time slot (a picture that fails to load is skipped)
+  SbcSlideshow.prototype.sync = function (force) {
     var self = this;
-    if (self.busy || !self.order.length) return Promise.resolve();
+    var slot = self.currentSlot();
+    if (self.busy || !self.order.length || (slot === self.slot && !force)) return Promise.resolve();
     self.busy = true;
     var tries = 0;
     function attempt() {
-      if (self.pos >= self.order.length) { self.order = shuffle(self.list); self.pos = 0; }
-      var url = self.order[self.pos++];
-      try { localStorage.setItem(STORE, String(self.pos)); } catch (e) { /* storage may be off */ }
-      return preload(url).then(function () { self.show(url); }, function () {
+      var url = self.order[(slot + self.offset) % self.order.length];
+      return preload(url).then(function () { self.slot = slot; self.show(url); }, function () {
+        self.offset++;
         if (++tries < 5) return attempt();
       });
     }
     return attempt().then(function () { self.busy = false; }, function () { self.busy = false; });
   };
 
+  // step ahead by one picture now (and stay one ahead of the clock from then on)
+  SbcSlideshow.prototype.next = function () {
+    this.offset++;
+    return this.sync(true);
+  };
+
   SbcSlideshow.prototype.start = function () {
     var self = this;
     self.stop();
-    var first = self.layers[self.front].style.backgroundImage ? Promise.resolve() : self.next();
-    return first.then(function () {
-      if (self.list.length > 1) self.timer = setInterval(function () { self.next(); }, self.interval);
+    return self.sync(true).then(function () {
+      if (self.list.length > 1) self.timer = setInterval(function () { self.sync(false); }, Math.min(5000, self.interval));
     });
   };
 
