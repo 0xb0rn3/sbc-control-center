@@ -79,6 +79,7 @@ USER_AGENT = 'SBCControlCenter'
 
 DEFAULTS: dict[str, str] = {
     'device_label': 'SBC Control Center',
+    'home_location': '',            # "lat,lon" for the threat map (empty: the time zone's city)
     'greeting_name': '',            # living-room greeting: "Good evening, <name>" (empty: no name)
     'uplink_interface': 'end0',
     'ap_interface': 'wlan1',

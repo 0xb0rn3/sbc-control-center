@@ -67,7 +67,7 @@ ASSETS_DIR = sbc_site.APP_DIR / 'assets'
 # two folders, plain file names and known types are served; nothing outside them can be named.
 STATIC_TYPES = {'.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
                 '.jpg': 'image/jpeg', '.webp': 'image/webp', '.png': 'image/png', '.json': 'application/json',
-                '.woff2': 'font/woff2'}
+                '.woff2': 'font/woff2', '.svg': 'image/svg+xml'}
 STATIC_PATH = re.compile(r'/assets/(vendor|ui|wallpapers)/([A-Za-z0-9][A-Za-z0-9_.-]{0,120})')
 STANDBY_PATH = sbc_site.APP_DIR / 'standby.html'
 WALLPAPER_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,120}\.(?:jpe?g|webp|png)')
@@ -1160,6 +1160,13 @@ class Handler(BaseHTTPRequestHandler):
             if not auth:
                 return
             result = agent_request({'action': 'vpn_library'}, timeout=10)
+            self.send_json(200 if result.get('ok') else 503, result)
+            return
+        if path == '/api/threat-map':
+            auth = self.require_session()
+            if not auth:
+                return
+            result = agent_request({'action': 'threat_map'}, timeout=15)
             self.send_json(200 if result.get('ok') else 503, result)
             return
         if path == '/api/packet-history':

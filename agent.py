@@ -46,6 +46,7 @@ import terminal_pty
 import sbc_site
 import vpn_library
 import packet_history
+import threat_map
 
 BASE = sbc_site.ETC_DIR
 STATE = sbc_site.STATE_DIR
@@ -1410,6 +1411,11 @@ def do_action(req: dict[str, Any], trusted_root_peer: bool = False) -> dict[str,
     if action == 'telemetry':
         with telemetry_lock:
             return {'ok': True, 'telemetry': telemetry.snapshot()}
+    if action == 'threat_map':
+        try:
+            return threat_map.snapshot()
+        except Exception as exc:
+            return {'ok': False, 'error': f'Threat map unavailable: {exc}'}
     if action == 'history_status':
         try:
             return packet_history.status()
@@ -1669,6 +1675,7 @@ def main() -> None:
                 print(f'[TERMINAL] reaper-error type={type(exc).__name__}', flush=True)
     threading.Thread(target=terminal_reaper, daemon=True, name='terminal-reaper').start()
     threading.Thread(target=vpn_rotation_scheduler, daemon=True, name='vpn-rotation').start()
+    threading.Thread(target=threat_map.refresher, daemon=True, name='threat-feeds').start()
     SOCKET_DIR.mkdir(mode=0o750, parents=True, exist_ok=True)
     try:
         SOCKET_PATH.unlink()

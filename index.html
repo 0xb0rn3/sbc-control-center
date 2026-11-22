@@ -393,6 +393,24 @@ pre { max-height: 430px; margin: 0; padding: 12px; overflow: auto; border: 1px s
 .history-table { max-height: 420px; }
 .history-table tr.unknown td:first-child { color: #edaaaa; }
 .history-table td small { display: block; color: var(--dim); }
+.map-world{opacity:.95}
+.live-arcs path{fill:none;stroke:rgba(125,190,214,.55);stroke-width:1.1}
+.live-arcs path.exit{stroke:rgba(240,185,165,.75);stroke-width:1.6;stroke-dasharray:4 3}
+.live-arcs path.hit{stroke:rgba(232,104,90,.9);stroke-width:1.6}
+.live-conns circle{fill:#7dbed6;stroke:#0e1820;stroke-width:1}
+.live-conns circle.hit{fill:#e8685a}
+.live-conns circle.new{animation:livePing 1.6s ease-out 1}
+.live-global circle{fill:rgba(232,150,90,.55)}
+.live-global circle.feodo{fill:rgba(232,104,90,.8)}
+@keyframes livePing{0%{r:9;opacity:.2}100%{opacity:1}}
+@media (prefers-reduced-motion:reduce){.live-conns circle.new{animation:none}}
+.live-legend{position:absolute;left:12px;top:10px;display:flex;flex-wrap:wrap;gap:6px 14px;padding:6px 10px;border-radius:8px;background:rgba(9,16,22,.72);font-size:10px;color:var(--muted)}
+.live-legend label{display:flex;align-items:center;gap:6px}
+.live-legend input{width:12px;height:12px;accent-color:var(--accent)}
+.lg{display:inline-block;width:8px;height:8px;border-radius:50%}.lg.conn{background:#7dbed6}.lg.glob{background:#e8965a}.lg.hit{background:#e8685a}.lg.dns{background:#8ca9b5}
+.live-h{margin:0 0 8px;font-size:12px}
+.live-table{max-height:300px}
+.live-table tr.hit td{color:#f0a89c}
 /* VPN servers */
 .vpn-layout { grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); }
 .vpn-small { font-size: 15px; overflow-wrap: anywhere; }
@@ -776,24 +794,25 @@ Type help to list the available commands. DNS commands: dns status, dns profiles
         <div class="pagehead"><div><h2>Threat intelligence & incidents</h2><p>Evidence-first network security events from local sensors. Refreshes on demand and every 10 seconds while this section is open.</p></div><button class="btn" id="securityRefreshBtn" type="button">Refresh intelligence</button></div>
         <div class="notice info" id="securityLimitations">Observed DNS attempts are not proof of successful bypass. IP geolocation is approximate. Reputation matches are indicators, not proof of compromise. This view never blocks traffic.</div>
         <div class="card threat-map-card" style="margin-top:12px">
-          <div class="cardhead"><div><h3>Live external endpoint map</h3><p class="sub">Approximate destination-IP geography from the local GeoLite2 database. Points represent observed network endpoints, not verified attacker locations.</p></div><div class="map-legend"><span><i class="legend-dot observed"></i>Observed</span><span><i class="legend-dot matched"></i>Feed match</span></div></div>
+          <div class="cardhead"><div><h3>Live threat map</h3><p class="sub">Where your devices connect right now (home, through the VPN exit, to each destination), against live global threat feeds. Places come from the local GeoIP database and are approximate; a feed match is a lead to check, not proof.</p></div><div class="map-legend"><span><i class="legend-dot observed"></i>Observed</span><span><i class="legend-dot matched"></i>Feed match</span></div></div>
           <div class="threat-map-wrap" id="threatMapWrap">
             <svg id="threatMapSvg" class="threat-map-svg" viewBox="0 0 1000 500" role="img" aria-label="World map showing approximate locations of observed external destination IP addresses">
               <g class="map-grid"><path d="M0 83.33H1000 M0 166.66H1000 M0 250H1000 M0 333.33H1000 M0 416.66H1000 M166.66 0V500 M333.33 0V500 M500 0V500 M666.66 0V500 M833.33 0V500"/></g>
-              <g class="map-land">
-                <path d="M55 112L76 77 112 62 145 68 162 89 194 102 217 129 203 151 184 165 177 195 151 217 132 199 116 182 104 160 82 151 64 130Z"/>
-                <path d="M222 236L248 225 270 245 281 278 269 315 257 353 243 389 230 363 224 330 227 295 214 263Z"/>
-                <path d="M276 58L307 49 332 67 327 92 302 108 279 91Z"/>
-                <path d="M420 111L443 91 471 83 495 91 523 78 548 91 580 80 612 86 642 78 676 91 707 100 739 115 776 120 812 101 849 115 889 143 878 175 847 180 824 193 792 185 762 203 733 185 704 179 672 191 640 178 613 186 589 166 559 172 538 151 505 161 481 147 458 158 437 137Z"/>
-                <path d="M435 187L469 183 497 197 519 221 516 258 501 295 479 342 461 320 449 285 433 248 426 216Z"/>
-                <path d="M752 312L785 300 821 312 835 331 815 352 784 356 760 340Z"/>
-                <path d="M895 366L910 359 922 370 915 383 901 381Z"/>
-              </g>
+              <image href="/assets/ui/world.svg" x="0" y="0" width="1000" height="500" preserveAspectRatio="none" class="map-world"/>
+              <g id="liveMapArcs" class="live-arcs"></g>
+              <g id="liveMapGlobal" class="live-global"></g>
+              <g id="liveMapConns" class="live-conns"></g>
+              <g id="liveMapHome"></g>
               <g id="threatMapMarkers" class="map-markers"></g>
             </svg>
             <div class="map-empty" id="threatMapEmpty">Waiting for geolocated endpoint observations. Install a local GeoLite2 City database to enable geographic markers.</div>
+            <div class="live-legend"><label><input type="checkbox" id="liveShowConns" checked> <i class="lg conn"></i>Your connections</label><label><input type="checkbox" id="liveShowGlobal" checked> <i class="lg glob"></i>Global threat activity</label><label><i class="lg hit"></i>Feed match</label><label><i class="lg dns"></i>DNS-bypass event</label></div>
           </div>
-          <div class="map-foot"><span id="threatMapStatus">No map data yet</span><span>Local GeoIP only · no remote lookups</span></div>
+          <div class="map-foot"><span id="threatMapStatus">No map data yet</span><span id="liveMapFeeds">Local GeoIP only · no remote lookups</span></div>
+          <div class="grid two" style="margin-top:12px">
+            <div><h4 class="live-h">Live connections</h4><div class="tablewrap live-table"><table class="compact"><thead><tr><th>Destination</th><th>Place</th><th>Devices</th><th>Ports</th></tr></thead><tbody id="liveConnRows"><tr><td colspan="4">Loading…</td></tr></tbody></table></div></div>
+            <div><h4 class="live-h">Threat feeds</h4><div class="tablewrap"><table class="compact"><thead><tr><th>Feed</th><th>Entries</th><th>Updated</th></tr></thead><tbody id="liveFeedRows"><tr><td colspan="3">Loading…</td></tr></tbody></table></div></div>
+          </div>
         </div>
         <div class="card threat-timeline-card" style="margin-top:12px">
           <div class="cardhead"><div><h3>Attack & observation timeline</h3><p class="sub">Hourly event counts over the last 24 hours, derived from retained sensor timestamps.</p></div><button class="btn small" id="securityTimelineClear" type="button">Clear time filter</button></div>
@@ -1690,6 +1709,37 @@ async function refreshHistory(showErrors=false){
   $('historyUnknown').textContent=String(d.unrecognised);
   $('historyRows').innerHTML=d.hosts.filter(h=>!h.multicast).map(h=>`<tr class="${h.unrecognised?'unknown':''}"><td class="mono">${vpnEsc(h.mac)}<small>${h.unrecognised?'Unrecognised':vpnEsc(h.known||'')}</small></td><td class="mono">${vpnEsc(h.ips.join(', ')||'—')}</td><td>${historyAgo(h.last)}<small>first ${historyAgo(h.first)}</small></td><td>${fmtBytes(h.bytes)}<small>${h.packets.toLocaleString()} packets</small></td><td>${vpnEsc(h.ifaces.join(', '))}</td></tr>`).join('')||'<tr><td colspan="5">No hour has been summarised yet. The first summary arrives within 15 minutes after the first full hour.</td></tr>';
 }
+
+// ---- live threat map: household connections (home -> VPN exit -> destination) and global feeds
+let liveMapTimer=null,liveMapSeen=new Set();
+const liveXY=(lat,lon)=>({x:(lon+180)/360*1000,y:(90-lat)/180*500});
+function liveArc(a,b,cls){const mx=(a.x+b.x)/2,my=(a.y+b.y)/2-Math.min(90,Math.hypot(b.x-a.x,b.y-a.y)*.25);return `<path class="${cls}" d="M${a.x.toFixed(1)} ${a.y.toFixed(1)}Q${mx.toFixed(1)} ${my.toFixed(1)} ${b.x.toFixed(1)} ${b.y.toFixed(1)}"/>`;}
+async function refreshLiveMap(){
+  let d;try{d=await api('/api/threat-map');}catch(e){$('threatMapStatus').textContent=e.message;return;}
+  const showConns=$('liveShowConns').checked,showGlobal=$('liveShowGlobal').checked;
+  const home=d.home&&Number.isFinite(d.home.lat)?liveXY(d.home.lat,d.home.lon):null;
+  const exit=d.exit?liveXY(d.exit.lat,d.exit.lon):null;
+  const hub=exit||home;
+  let arcs='',dots='';
+  if(home&&exit)arcs+=liveArc(home,exit,'exit');
+  if(showConns)(d.connections||[]).forEach(c=>{if(!c.geo)return;const p=liveXY(c.geo.lat,c.geo.lon);const hit=c.feeds.length>0;
+    if(hub)arcs+=liveArc(hub,p,hit?'hit':'');const fresh=!liveMapSeen.has(c.ip);
+    dots+=`<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="${Math.min(6,2.2+Math.log2(c.count+1))}" class="${hit?'hit':''}${fresh?' new':''}"><title>${vpnEsc(c.ip)} · ${vpnEsc([c.geo.city,c.geo.country].filter(Boolean).join(', '))} · ${c.count} connection(s) from ${vpnEsc(c.clients.join(', '))}${hit?' · on '+vpnEsc(c.feeds.join(', ')):''}</title></circle>`;});
+  liveMapSeen=new Set((d.connections||[]).map(c=>c.ip));
+  $('liveMapArcs').innerHTML=arcs;$('liveMapConns').innerHTML=dots;
+  $('liveMapGlobal').innerHTML=showGlobal?(d.global||[]).map(g=>{const p=liveXY(g.lat,g.lon);return `<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="${g.feed==='feodo'?2.6:1.8}" class="${g.feed}"><title>${vpnEsc(g.ip)} · ${vpnEsc(g.city||g.country)} · ${g.feed==='feodo'?'botnet command server '+vpnEsc(g.malware||''):g.attacks+' targets attacked'}</title></circle>`;}).join(''):'';
+  let homeSvg='';if(home)homeSvg+=`<circle cx="${home.x}" cy="${home.y}" r="5" fill="#f0b9a5" stroke="#fff" stroke-width="1.5"><title>${vpnEsc(d.home.label)}</title></circle>`;
+  if(exit)homeSvg+=`<circle cx="${exit.x}" cy="${exit.y}" r="5" fill="#0e1820" stroke="#f0b9a5" stroke-width="2"><title>VPN exit · ${vpnEsc(d.exit.city)} · ${vpnEsc(d.exit.hostname||d.exit.ip)}</title></circle>`;
+  $('liveMapHome').innerHTML=homeSvg;
+  const conns=d.connections||[],matches=d.matches||[];
+  if(conns.length||(d.global||[]).length)$('threatMapEmpty').classList.add('hidden');
+  $('threatMapStatus').textContent=`${conns.length} live destination(s) · ${matches.length} feed match(es) · ${(d.global||[]).length} global threat point(s) · updated ${new Date(d.generated*1000).toLocaleTimeString()}`;
+  $('liveConnRows').innerHTML=conns.slice(0,60).map(c=>`<tr class="${c.feeds.length?'hit':''}"><td class="mono">${vpnEsc(c.ip)}${c.feeds.length?`<small> · ${vpnEsc(c.feeds.join(', '))}</small>`:''}</td><td>${c.geo?`${vpnFlag(c.geo.cc)} ${vpnEsc(c.geo.city||c.geo.country)}`:'—'}</td><td>${vpnEsc(c.clients.join(', '))}</td><td class="mono">${vpnEsc(c.ports.join(', '))}</td></tr>`).join('')||'<tr><td colspan="4">No device is connected to the internet right now.</td></tr>';
+  $('liveFeedRows').innerHTML=Object.entries(d.feeds||{}).map(([k,f])=>`<tr><td>${vpnEsc(f.label)}</td><td>${(f.entries||0).toLocaleString()}</td><td>${f.fetched?vpnAgo(f.fetched):'not yet'}</td></tr>`).join('');
+  $('liveMapFeeds').textContent='Local GeoIP · feeds fetched through the VPN tunnel';
+}
+function startLiveMap(){clearInterval(liveMapTimer);refreshLiveMap();liveMapTimer=setInterval(()=>{if(document.visibilityState!=='hidden'&&currentSection==='security-operations'&&!standbyActive)refreshLiveMap();},5000);}
+['liveShowConns','liveShowGlobal'].forEach(id=>$(id).addEventListener('change',refreshLiveMap));
 function fmtRate(bytes){return `${fmtBytes(bytes)}/s`;}
 function drawLineChart(canvasId,series,maximum=null){
   const canvas=$(canvasId);if(!canvas)return;const rect=canvas.getBoundingClientRect();if(rect.width<20)return;
@@ -1840,6 +1890,7 @@ function navigate(target){
   const reduceMotion=window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   el.scrollIntoView({behavior:reduceMotion?'auto':'smooth',block:'start'});
   if(target==='packet-inspector'){refreshPacketInspector(false);refreshPacketTools();refreshHistory(false);}
+  if(target==='security-operations')startLiveMap();
   if(target==='vpn'){refreshVpn(false);api('/api/vpn/job').then(r=>{renderVpnJob(r.job);if(r.job&&r.job.state==='running')followVpnJob();}).catch(()=>{});}
 }
 document.querySelectorAll('.navbtn[data-target],.nav-center-item').forEach(button=>button.addEventListener('click',()=>navigate(button.dataset.target)));
