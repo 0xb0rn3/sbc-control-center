@@ -75,7 +75,13 @@
   // ---- player
   function play(id) {
     status('Opening…');
-    api('video?id=' + encodeURIComponent(id)).then(function (v) {
+    // the resume point is read alongside the lookup, so the player starts loading right there
+    var resumeAt = api('history').then(function (h) {
+      var seen = (h.items || []).filter(function (x) { return x.id === id; })[0];
+      return seen && seen.position && (!seen.duration || seen.position < seen.duration - 30) ? seen.position : -1;
+    }).catch(function () { return -1; });
+    Promise.all([api('video?id=' + encodeURIComponent(id)), resumeAt]).then(function (both) {
+      var v = both[0], startAt = both[1];
       if (!v.hls) throw new Error('No playable stream for this video.');
       current = v;
       $('player').hidden = false;
@@ -87,7 +93,7 @@
       var video = $('video');
       if (hls) { hls.destroy(); hls = null; }
       if (window.Hls && window.Hls.isSupported()) {
-        hls = new window.Hls({maxBufferLength: 30});
+        hls = new window.Hls({maxBufferLength: 30, startPosition: startAt});
         hls.loadSource(v.hls);
         hls.attachMedia(video);
         hls.on(window.Hls.Events.MANIFEST_PARSED, function () {
@@ -99,7 +105,8 @@
         });
         hls.on(window.Hls.Events.ERROR, function (_e, data) { if (data.fatal) { status('Playback error: ' + data.details); } });
       } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-        video.src = v.hls; video.addEventListener('loadedmetadata', start, {once: true});
+        video.src = v.hls;
+        video.addEventListener('loadedmetadata', function () { if (startAt > 0) video.currentTime = startAt; start(); }, {once: true});
       } else { throw new Error('This browser cannot play HLS video.'); }
       $('subBtn').focus();
       wake();
@@ -108,10 +115,7 @@
   }
   function start() {
     var video = $('video');
-    api('history').then(function (h) {
-      var seen = (h.items || []).filter(function (x) { return x.id === current.id; })[0];
-      if (seen && seen.position && (!seen.duration || seen.position < seen.duration - 30)) video.currentTime = seen.position;
-    }).catch(function () {}).then(function () { video.play().catch(function () {}); });
+    video.play().catch(function () {});
     clearInterval(saveTimer);
     saveTimer = setInterval(remember, 15000);
   }

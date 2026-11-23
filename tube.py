@@ -318,16 +318,139 @@ def rewrite_playlist(text: str, base: str, h264_only: bool = False) -> str:
     return '\n'.join(out) + '\n'
 
 
-def _open_stream(url: str, range_header: str | None = None):
+SEG_CACHE_BYTES = 96_000_000   # about 20 segments at 1080p: what is fetched ahead and not yet played
+SEG_CACHE_TTL = 180
+PREFETCH_AHEAD = 2             # segments fetched while the TV plays the current one
+_REDIRECTS = (301, 302, 303, 307, 308)
+_idle: dict[str, list[http.client.HTTPSConnection]] = {}
+_idle_lock = threading.Lock()
+_seg_cache: dict[str, tuple[float, int, dict[str, str], bytes]] = {}
+_seg_bytes = 0
+_inflight: dict[str, threading.Event] = {}
+_next_seg: dict[str, str] = {}
+_seg_lock = threading.Lock()
+
+
+def _stream_get(url: str, range_header: str | None = None) -> tuple[int, dict[str, str], bytes, str]:
+    """GET a googlevideo address over a kept-open connection: through a far tunnel exit a new
+    TCP+TLS connection costs about a second, and a warm one also runs about twice as fast.
+    Returns status, the headers worth passing on, the body, and the final address."""
     headers = {'User-Agent': UA}
     if range_header and re.fullmatch(r'bytes=\d{0,15}-\d{0,15}', range_header):
         headers['Range'] = range_header
-    resp = urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30)
-    final = urllib.parse.urlsplit(resp.geturl())
-    if final.scheme != 'https' or not RELAY_HOST.fullmatch(final.hostname or ''):
-        resp.close()
-        raise ValueError('stream redirected off googlevideo')
-    return resp
+    for _hop in range(4):
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme != 'https' or not RELAY_HOST.fullmatch(parts.hostname or ''):
+            raise ValueError('stream address off googlevideo')
+        host, path = parts.hostname, parts.path + ('?' + parts.query if parts.query else '')
+        for attempt in (1, 2):
+            with _idle_lock:
+                pool = _idle.get(host) or []
+                conn = pool.pop() if pool else None
+            reused = conn is not None
+            conn = conn or http.client.HTTPSConnection(host, timeout=30)
+            try:
+                conn.request('GET', path, headers=headers)
+                resp = conn.getresponse()
+                if int(resp.getheader('Content-Length') or 0) > 64_000_000:
+                    raise ValueError('stream part too large')
+                body = resp.read()
+                break
+            except (http.client.HTTPException, OSError):
+                conn.close()
+                if not reused or attempt == 2:   # a kept connection may have timed out: one retry on a new one
+                    raise
+        kept = {name: resp.getheader(name) for name in ('Content-Type', 'Content-Range', 'Accept-Ranges', 'Location') if resp.getheader(name)}
+        if resp.will_close:
+            conn.close()
+        else:
+            with _idle_lock:
+                pool = _idle.setdefault(host, [])
+                if len(pool) < 6:
+                    pool.append(conn)
+                else:
+                    conn.close()
+        if resp.status in _REDIRECTS and kept.get('Location'):
+            url = urllib.parse.urljoin(url, kept['Location'])
+            continue
+        kept.pop('Location', None)
+        return resp.status, kept, body, url
+    raise ValueError('too many redirects')
+
+
+def _remember_order(urls: list[str]) -> None:
+    """A media playlist's segment order, so each request can start fetching the ones after it."""
+    with _seg_lock:
+        for a, b in zip(urls, urls[1:]):
+            _next_seg[a] = b
+        while len(_next_seg) > 20000:
+            _next_seg.pop(next(iter(_next_seg)))
+
+
+def _store(url: str, entry: tuple[float, int, dict[str, str], bytes]) -> None:
+    global _seg_bytes
+    with _seg_lock:
+        old = _seg_cache.pop(url, None)
+        if old:
+            _seg_bytes -= len(old[3])
+        _seg_cache[url] = entry
+        _seg_bytes += len(entry[3])
+        while _seg_bytes > SEG_CACHE_BYTES and _seg_cache:
+            _seg_bytes -= len(_seg_cache.pop(next(iter(_seg_cache)))[3])
+
+
+def _take(url: str) -> tuple[float, int, dict[str, str], bytes] | None:
+    global _seg_bytes
+    with _seg_lock:
+        hit = _seg_cache.pop(url, None)   # each segment is played once: hand it over and free the memory
+        if hit:
+            _seg_bytes -= len(hit[3])
+    return hit if hit and time.time() - hit[0] < SEG_CACHE_TTL else None
+
+
+def _prefetch(url: str) -> None:
+    with _seg_lock:
+        if url in _seg_cache or url in _inflight:
+            return
+        done = _inflight[url] = threading.Event()
+    def work():
+        try:
+            status, headers, body, _final = _stream_get(url)
+            if status == 200:
+                _store(url, (time.time(), status, headers, body))
+        except Exception:
+            pass   # the TV's own request will fetch it and report any error
+        finally:
+            with _seg_lock:
+                _inflight.pop(url, None)
+            done.set()
+    threading.Thread(target=work, daemon=True).start()
+
+
+def _prefetch_after(url: str, count: int = PREFETCH_AHEAD) -> None:
+    with _seg_lock:
+        ahead, cur = [], url
+        for _ in range(count):
+            cur = _next_seg.get(cur)
+            if not cur:
+                break
+            ahead.append(cur)
+    for nxt in ahead:
+        _prefetch(nxt)
+
+
+def segment(url: str, range_header: str | None = None) -> tuple[int, dict[str, str], bytes, str]:
+    """A segment for the TV: from what was fetched ahead when possible, then start on the next ones."""
+    if range_header:
+        return _stream_get(url, range_header)
+    with _seg_lock:
+        waiting = _inflight.get(url)
+    if waiting:
+        waiting.wait(45)
+    hit = _take(url)
+    result = (hit[1], hit[2], hit[3], url) if hit else _stream_get(url)
+    _prefetch_after(url)
+    return result
 
 
 def stream_master(video_id: str) -> str:
@@ -335,13 +458,16 @@ def stream_master(video_id: str) -> str:
     master = video(video_id).get('hls')
     if not master:
         raise ValueError('No playable stream for this video.')
-    with _open_stream(master) as resp:
-        return rewrite_playlist(resp.read(4_000_000).decode('utf-8', 'replace'), resp.geturl(), h264_only=True)
+    status, _headers, body, final = _stream_get(master)
+    if status != 200:
+        raise ValueError(f'YouTube answered {status} for the stream list')
+    return rewrite_playlist(body.decode('utf-8', 'replace'), final, h264_only=True)
 
 
-def _is_playlist(resp, url: str) -> bool:
-    ctype = (resp.headers.get('Content-Type') or '').lower()
+def _is_playlist(headers: dict[str, str], url: str) -> bool:
+    ctype = (headers.get('Content-Type') or '').lower()
     return 'mpegurl' in ctype or urllib.parse.urlsplit(url).path.endswith('.m3u8')
+
 
 
 def channel(channel_id: str) -> list[dict[str, Any]]:
@@ -556,23 +682,31 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def relay(self, target: str) -> None:
-        """A playlist comes back rewritten; anything else (segments) streams through as it arrives."""
-        with _open_stream(target, self.headers.get('Range')) as resp:
-            if _is_playlist(resp, resp.geturl()):
-                text = rewrite_playlist(resp.read(4_000_000).decode('utf-8', 'replace'), resp.geturl())
-                self.send_bytes(200, text.encode(), 'application/vnd.apple.mpegurl')
-                return
-            self.send_response(resp.status)
-            for name in ('Content-Type', 'Content-Length', 'Content-Range', 'Accept-Ranges'):
-                if resp.headers.get(name):
-                    self.send_header(name, resp.headers[name])
-            self.send_header('Cache-Control', 'no-store')
-            self.end_headers()
-            try:
-                while chunk := resp.read(65536):
-                    self.wfile.write(chunk)
-            except (BrokenPipeError, ConnectionResetError):
-                pass   # the TV skipped ahead or closed the video
+        """A playlist comes back rewritten (a media playlist also starts the first segments on their
+        way); a segment comes from what was fetched ahead, or straight from YouTube."""
+        if not _is_playlist({}, target) and '/videoplayback' in target:
+            status, headers, body, final = segment(target, self.headers.get('Range'))
+        else:
+            status, headers, body, final = _stream_get(target, self.headers.get('Range'))
+        if status == 200 and (_is_playlist(headers, final) or body.lstrip().startswith(b'#EXTM3U')):
+            text = body.decode('utf-8', 'replace')
+            if '#EXTINF' in text:
+                urls = [urllib.parse.urljoin(final, l.strip()) for l in text.splitlines() if l.strip() and not l.startswith('#')]
+                _remember_order(urls)
+                for first in urls[:PREFETCH_AHEAD]:
+                    _prefetch(first)
+            self.send_bytes(200, rewrite_playlist(text, final).encode(), 'application/vnd.apple.mpegurl')
+            return
+        self.send_response(status)
+        for name, value in headers.items():
+            self.send_header(name, value)
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass   # the TV skipped ahead or closed the video
 
     def do_GET(self) -> None:
         url = urllib.parse.urlparse(self.path)

@@ -4,6 +4,7 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.parse
@@ -118,27 +119,6 @@ seg1.ts
 """
 
 
-class FakeResponse:
-    def __init__(self, url, body, ctype, status=200):
-        self.url, self.body, self.status = url, io.BytesIO(body), status
-        self.headers = {'Content-Type': ctype, 'Content-Length': str(len(body))}
-
-    def read(self, n=-1):
-        return self.body.read(n)
-
-    def geturl(self):
-        return self.url
-
-    def close(self):
-        pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-
 class RelayTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -146,6 +126,9 @@ class RelayTests(unittest.TestCase):
         self.p.start()
         tube._relay_key = None
         tube._cache.clear()
+        tube._seg_cache.clear()
+        tube._next_seg.clear()
+        tube._seg_bytes = 0
 
     def tearDown(self):
         self.p.stop()
@@ -197,11 +180,11 @@ class RelayTests(unittest.TestCase):
         master_url = 'https://manifest.googlevideo.com/api/manifest/hls_variant/id/1'
         segment = b'\x47' + b'\x00' * 187 * 3
         seg_url = 'https://rr2---sn-abc.googlevideo.com/videoplayback/sq/0/file/seg.ts'
-        def fake_open(url, range_header=None):
+        def fake_get(url, range_header=None):
             if url == master_url:
-                return FakeResponse(url, MASTER.encode(), 'application/vnd.apple.mpegurl')
+                return 200, {'Content-Type': 'application/vnd.apple.mpegurl'}, MASTER.encode(), url
             if url == seg_url:
-                return FakeResponse(url, segment, 'application/octet-stream')
+                return 200, {'Content-Type': 'application/octet-stream'}, segment, url
             raise AssertionError(url)
         server = tube.ThreadingHTTPServer(('127.0.0.1', 0), tube.Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -209,7 +192,7 @@ class RelayTests(unittest.TestCase):
         get = lambda path: urllib.request.build_opener(urllib.request.ProxyHandler({})).open(base + path, timeout=10)
         try:
             with mock.patch.object(tube, 'video', return_value={'id': 'jNQXAC9IVRw', 'hls': master_url, 'title': 't'}), \
-                 mock.patch.object(tube, '_open_stream', side_effect=fake_open):
+                 mock.patch.object(tube, '_stream_get', side_effect=fake_get):
                 v = json.loads(get('/video?id=jNQXAC9IVRw').read())
                 self.assertEqual(v['hls'], '/api/tv/stream?id=jNQXAC9IVRw')          # the TV never sees googlevideo
                 with get('/stream?id=jNQXAC9IVRw') as r:
@@ -222,6 +205,44 @@ class RelayTests(unittest.TestCase):
                 with self.assertRaises(urllib.error.HTTPError) as bad:
                     get('/hls?u=' + link.split('u=')[1].split('&')[0] + '&s=' + '0' * 32)
                 self.assertEqual(bad.exception.code, 502)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_segments_are_fetched_ahead_once(self):
+        base = 'https://rr2---sn-abc.googlevideo.com/videoplayback/id/1/'
+        playlist = '#EXTM3U\n' + ''.join(f'#EXTINF:5.0,\n{base}sq/{i}/file/seg.ts\n' for i in range(5)) + '#EXT-X-ENDLIST\n'
+        calls = []
+        lock = threading.Lock()
+        def fake_get(url, range_header=None):
+            with lock:
+                calls.append(url)
+            if url.endswith('index.m3u8'):
+                return 200, {'Content-Type': 'application/vnd.apple.mpegurl'}, playlist.encode(), url
+            return 200, {'Content-Type': 'video/mp2t'}, url.encode(), url
+        server = tube.ThreadingHTTPServer(('127.0.0.1', 0), tube.Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        get = lambda link: urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
+            f'http://127.0.0.1:{server.server_address[1]}' + link[len('/api/tv'):], timeout=10).read()
+        def settle():
+            for _ in range(100):
+                with tube._seg_lock:
+                    if not tube._inflight:
+                        return
+                time.sleep(0.02)
+        try:
+            with mock.patch.object(tube, '_stream_get', side_effect=fake_get):
+                text = get(tube.relay_link(base + 'index.m3u8')).decode()
+                links = [l for l in text.splitlines() if l.startswith('/api/tv/hls')]
+                self.assertEqual(len(links), 5)
+                settle()
+                self.assertEqual(sorted(calls[1:]), [base + 'sq/0/file/seg.ts', base + 'sq/1/file/seg.ts'])   # started with the playlist
+                for i, link in enumerate(links):
+                    self.assertEqual(get(link), f'{base}sq/{i}/file/seg.ts'.encode())
+                    settle()
+                segs = [c for c in calls if c.endswith('seg.ts')]
+                self.assertEqual(sorted(segs), sorted(f'{base}sq/{i}/file/seg.ts' for i in range(5)))   # each fetched exactly once
+                self.assertEqual(tube._seg_bytes, 0)   # everything fetched ahead was played and freed
         finally:
             server.shutdown()
             server.server_close()
