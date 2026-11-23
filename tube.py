@@ -208,10 +208,62 @@ def search(query: str, count: int = 24, ttl: float = 600, background: bool = Fal
     return _cached(f's:{query}:{count}', ttl, make)
 
 
+TVHTML5_CLIENT = {'clientName': 'TVHTML5', 'clientVersion': '7.20250101.00.00',
+                  'hl': 'en', 'gl': 'US', 'platform': 'TV', 'clientScreen': 'WATCH'}
+
+
+def video_direct(video_id: str) -> dict[str, Any] | None:
+    """YouTube's player endpoint as a TV client: returns an HLS master manifest in H.264 + AAC,
+    which every smart-TV browser plays. About a second; no yt-dlp subprocess."""
+    body = json.dumps({'context': {'client': TVHTML5_CLIENT}, 'videoId': video_id,
+                       'contentCheckOk': True, 'racyCheckOk': True}).encode()
+    data = json.loads(_https('www.youtube.com', 'POST', '/youtubei/v1/player?prettyPrint=false',
+                             body, {'Content-Type': 'application/json'}))
+    streaming = data.get('streamingData') or {}
+    hls = streaming.get('hlsManifestUrl')
+    if not hls:
+        return None
+    details = data.get('videoDetails') or {}
+    micro = ((data.get('microformat') or {}).get('playerMicroformatRenderer') or {})
+    captions_tracks = (((data.get('captions') or {}).get('playerCaptionsTracklistRenderer') or {}).get('captionTracks') or [])
+    subs = []
+    for t in captions_tracks[:30]:
+        lang = str(t.get('languageCode') or '')
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,20}', lang):
+            continue
+        name = _text(t.get('name')) or lang
+        auto = (t.get('kind') == 'asr')
+        subs.append({'lang': lang, 'name': name[:40] + (' (auto)' if auto else ''), 'auto': auto, '_url': t.get('baseUrl')})
+    # capture caption URLs for later /captions requests; strip the private field from the reply
+    _caption_urls[video_id] = {(s['lang'], s['auto']): s['_url'] for s in subs if s.get('_url')}
+    try:
+        duration = int(details.get('lengthSeconds') or 0) or None
+    except ValueError:
+        duration = None
+    try:
+        views = int(details.get('viewCount') or 0) or None
+    except ValueError:
+        views = None
+    return {'id': video_id, 'title': str(details.get('title') or '')[:200],
+            'channel': str(details.get('author') or '')[:80],
+            'channel_id': details.get('channelId') if CHANNEL_ID.fullmatch(str(details.get('channelId') or '')) else None,
+            'duration': duration, 'views': views, 'thumb': _thumb(video_id),
+            'hls': hls, 'live': bool(details.get('isLive')) or bool(details.get('isLiveContent')),
+            'description': str(details.get('shortDescription') or micro.get('description', {}).get('simpleText') or '')[:600],
+            'subtitles': [{k: v for k, v in s.items() if not k.startswith('_')} for s in subs],
+            'chapters': []}
+
+
 def video(video_id: str) -> dict[str, Any]:
     if not VIDEO_ID.fullmatch(video_id or ''):
         raise ValueError('not a video id')
     def make():
+        try:   # TVHTML5 client first: about a second, H.264 HLS every TV plays
+            tv = video_direct(video_id)
+            if tv and tv.get('hls'):
+                return tv
+        except Exception:
+            pass
         d = _ytdlp([f'https://www.youtube.com/watch?v={video_id}'])
         formats = d.get('formats') or []
         hls = [f for f in formats if str(f.get('protocol', '')).startswith('m3u8')]
@@ -257,8 +309,42 @@ def channel(channel_id: str) -> list[dict[str, Any]]:
     return _cached(f'c:{channel_id}', 900, make)
 
 
+def _timedtext_to_vtt(xml: bytes) -> str:
+    """YouTube timedtext XML -> WebVTT. Both forms become cues: <text start dur> in seconds
+    (the classic transcript) and <p t d> in milliseconds (timedtext format 3)."""
+    import html
+    cues = ['WEBVTT', '']
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError:
+        return 'WEBVTT\n'
+    def ts(s: float) -> str:
+        h, s = divmod(s, 3600); m, s = divmod(s, 60)
+        return f'{int(h):02d}:{int(m):02d}:{s:06.3f}'
+    for t in root.iter():
+        if t.tag == 'text':
+            start_raw, dur_raw, scale = t.get('start'), t.get('dur'), 1.0
+        elif t.tag == 'p':
+            start_raw, dur_raw, scale = t.get('t'), t.get('d'), 1000.0
+        else:
+            continue
+        try:
+            start = float(start_raw or 0) / scale
+            dur = float(dur_raw) / scale if dur_raw else 2.0
+        except ValueError:
+            continue
+        text = html.unescape(''.join(t.itertext())).replace('\n', ' ').strip()
+        if not text:
+            continue
+        cues.append(f'{ts(start)} --> {ts(start + dur)}')
+        cues.append(text)
+        cues.append('')
+    return '\n'.join(cues)
+
+
 def captions(video_id: str, lang: str, auto: bool) -> str:
-    """A subtitle track as WebVTT, fetched through the tunnel (the page cannot reach it directly)."""
+    """A subtitle track as WebVTT, fetched through the tunnel (the page cannot reach it directly).
+    YouTube serves captions as timedtext XML for TV clients, so we convert to VTT here."""
     if not VIDEO_ID.fullmatch(video_id or '') or not re.fullmatch(r'[A-Za-z0-9_-]{1,20}', lang or ''):
         raise ValueError('bad caption request')
     if video_id not in _caption_urls:
@@ -268,6 +354,11 @@ def captions(video_id: str, lang: str, auto: bool) -> str:
         raise ValueError('no such caption track')
     def make():
         raw = urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'}), timeout=20).read(3_000_000)
+        if raw.lstrip().startswith(b'WEBVTT'):
+            return raw.decode('utf-8', 'replace')
+        # timedtext XML: what the caption addresses of the TV player return
+        if raw.lstrip().startswith(b'<'):
+            return _timedtext_to_vtt(raw)
         return raw.decode('utf-8', 'replace')
     return _cached(f'cc:{video_id}:{lang}:{auto}', 7200, make)
 

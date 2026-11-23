@@ -1,3 +1,5 @@
+import io
+import json
 import shutil
 import tempfile
 import unittest
@@ -32,7 +34,7 @@ class TubeTests(unittest.TestCase):
                 'formats': [{'protocol': 'https', 'url': 'https://x/a'}, {'protocol': 'm3u8_native', 'url': 'https://x/v.m3u8', 'manifest_url': 'https://x/master.m3u8', 'height': 720}],
                 'subtitles': {'de': [{'ext': 'vtt', 'url': 'https://x/de.vtt', 'name': 'German'}]},
                 'automatic_captions': {'en': [{'ext': 'vtt', 'url': 'https://x/en.vtt'}], 'fr': [{'ext': 'vtt', 'url': 'https://x/fr.vtt'}]}}
-        with mock.patch.object(tube, '_ytdlp', return_value=fake):
+        with mock.patch.object(tube, 'video_direct', return_value=None), mock.patch.object(tube, '_ytdlp', return_value=fake):
             v = tube.video('jNQXAC9IVRw')
         self.assertEqual(v['hls'], 'https://x/master.m3u8')
         self.assertEqual(sorted(s['lang'] for s in v['subtitles']), ['de', 'en'])   # auto captions: English only here
@@ -67,6 +69,47 @@ class TubeTests(unittest.TestCase):
                 tube.set_cookies(".youtube.com\tTRUE\t/\tTRUE\t1999999999\tPREF\tf6=40000000")
             tube.clear_cookies()
             self.assertFalse((self.tmp / 'cookies.txt').exists())
+
+    def test_video_prefers_the_tv_client(self):
+        player = {'streamingData': {'hlsManifestUrl': 'https://x/tv/master.m3u8'},
+                  'videoDetails': {'title': 'Me at the zoo', 'author': 'jawed', 'channelId': 'UC4QobU6STFB0P71PMvOGN5A',
+                                   'lengthSeconds': '19', 'viewCount': '1000'},
+                  'captions': {'playerCaptionsTracklistRenderer': {'captionTracks': [
+                      {'languageCode': 'en', 'name': {'simpleText': 'English'}, 'kind': 'asr', 'baseUrl': 'https://x/tt?lang=en'},
+                      {'languageCode': '../x', 'baseUrl': 'https://x/bad'}]}}}
+        ytdlp = mock.Mock(side_effect=AssertionError('yt-dlp must not run when the TV client answers'))
+        with mock.patch.object(tube, '_https', return_value=json.dumps(player).encode()), mock.patch.object(tube, '_ytdlp', ytdlp):
+            v = tube.video('jNQXAC9IVRw')
+        self.assertEqual(v['hls'], 'https://x/tv/master.m3u8')
+        self.assertEqual((v['duration'], v['views'], v['channel']), (19, 1000, 'jawed'))
+        self.assertEqual(v['subtitles'], [{'lang': 'en', 'name': 'English (auto)', 'auto': True}])   # no private URL leaks
+        self.assertEqual(tube._caption_urls['jNQXAC9IVRw'], {('en', True): 'https://x/tt?lang=en'})
+
+    def test_video_falls_back_to_ytdlp_without_tv_hls(self):
+        fake = {'title': 't', 'formats': [{'protocol': 'm3u8_native', 'url': 'https://x/v.m3u8', 'manifest_url': 'https://x/master.m3u8'}]}
+        with mock.patch.object(tube, '_https', side_effect=OSError('offline')), mock.patch.object(tube, '_ytdlp', return_value=fake):
+            self.assertEqual(tube.video('jNQXAC9IVRw')['hls'], 'https://x/master.m3u8')
+
+    def test_timedtext_becomes_webvtt(self):
+        xml = b'<?xml version="1.0"?><transcript><text start="0.5" dur="2">Hello &amp;amp; welcome</text>' \
+              b'<text start="3661.25" dur="1.5">late\nline</text><text start="x">bad</text><text start="9" dur="1"> </text></transcript>'
+        self.assertEqual(tube._timedtext_to_vtt(xml),
+                         'WEBVTT\n\n00:00:00.500 --> 00:00:02.500\nHello & welcome\n\n01:01:01.250 --> 01:01:02.750\nlate line\n')
+        self.assertEqual(tube._timedtext_to_vtt(b'not xml <'), 'WEBVTT\n')
+        srv3 = b'<?xml version="1.0" encoding="utf-8" ?><timedtext format="3"><body>' \
+               b'<p t="1500" d="2250"><s>two</s><s> words</s></p><p t="4000">no duration</p></body></timedtext>'
+        self.assertEqual(tube._timedtext_to_vtt(srv3),
+                         'WEBVTT\n\n00:00:01.500 --> 00:00:03.750\ntwo words\n\n00:00:04.000 --> 00:00:06.000\nno duration\n')
+
+    def test_captions_convert_xml_and_pass_vtt_through(self):
+        tube._caption_urls['jNQXAC9IVRw'] = {('en', False): 'https://x/en', ('de', False): 'https://x/de'}
+        bodies = {'https://x/en': b'<transcript><text start="1" dur="1">hi</text></transcript>',
+                  'https://x/de': b'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nhallo\n'}
+        def fake_urlopen(req, timeout=None):
+            return io.BytesIO(bodies[req.full_url])
+        with mock.patch.object(tube.urllib.request, 'urlopen', fake_urlopen):
+            self.assertEqual(tube.captions('jNQXAC9IVRw', 'en', False), 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nhi\n')
+            self.assertTrue(tube.captions('jNQXAC9IVRw', 'de', False).startswith('WEBVTT\n\n00:00:01.000'))
 
 
 if __name__ == '__main__':
