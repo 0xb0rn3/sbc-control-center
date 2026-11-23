@@ -5,7 +5,7 @@
   'use strict';
   var $ = function (id) { return document.getElementById(id); };
   var BACK = [8, 27, 461, 10009, 166];   // Backspace, Escape and the TV remotes' Back keys
-  var current = null, hls = null, infoTimer = null, saveTimer = null, subs = [];
+  var current = null, hls = null, infoTimer = null, saveTimer = null, subs = [], account = false;
 
   function esc(v) { return String(v == null ? '' : v).replace(/[&<>"']/g, function (c) { return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]; }); }
   function dur(s) { if (!s && s !== 0) return ''; s = Math.round(s); var h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60; return (h ? h + ':' + (m < 10 ? '0' : '') : '') + m + ':' + (x < 10 ? '0' : '') + x; }
@@ -15,39 +15,56 @@
   }
   function status(text) { $('status').textContent = text || ''; }
 
-  // ---- lists
+  // ---- lists: home is rows you scroll sideways; search, history and Watch Later are a grid
+  var TOPICS = [['Bongo Flava', 'bongo flava new songs'], ['Music', 'official music video'], ['Live now', 'live stream'],
+                ['Chill', 'lofi hip hop'], ['Tech', 'tech review'], ['News', 'world news today'], ['Comedy', 'stand up comedy']];
+  function card(v) {
+    var progress = v.position && v.duration ? '<i class="bar" style="width:' + Math.min(100, v.position / v.duration * 100).toFixed(0) + '%"></i>' : '';
+    return '<article class="tv-card" tabindex="0" data-nav data-id="' + esc(v.id) + '"><div class="thumb"><img loading="lazy" alt="" src="' + esc(v.thumb) + '">' +
+      (v.duration ? '<span class="d">' + dur(v.duration) + '</span>' : '') + progress + '</div><div class="meta"><div class="t">' + esc(v.title) + '</div><div class="c">' + esc(v.channel || '') + '</div></div></article>';
+  }
+  function skeleton(n) { var out = ''; for (var i = 0; i < n; i++) out += '<div class="tv-card tv-skel"><div class="thumb"></div></div>'; return out; }
+  function tab(id) { ['homeBtn', 'recBtn', 'historyBtn', 'laterBtn'].forEach(function (b) { $(b).classList.toggle('on', b === id); }); }
+  function focusFirst(scope) { var f = scope.querySelector('.tv-card[data-nav]'); if (f && (document.activeElement === document.body || !document.activeElement)) f.focus(); }
   function show(title, items, note) {
+    $('rows').hidden = true; $('list').hidden = false;
     $('rowTitle').textContent = title;
     status(note || (items.length ? '' : 'Nothing here yet.'));
-    $('grid').innerHTML = items.map(function (v) {
-      var progress = v.position && v.duration ? '<i class="bar" style="width:' + Math.min(100, v.position / v.duration * 100).toFixed(0) + '%"></i>' : '';
-      return '<article class="tv-card" tabindex="0" data-nav data-id="' + esc(v.id) + '"><div class="thumb"><img loading="lazy" alt="" src="' + esc(v.thumb) + '">' +
-        (v.duration ? '<span class="d">' + dur(v.duration) + '</span>' : '') + progress + '</div><div class="meta"><div class="t">' + esc(v.title) + '</div><div class="c">' + esc(v.channel || '') + '</div></div></article>';
-    }).join('');
-    var first = $('grid').querySelector('[data-nav]');
-    if (first && document.activeElement === document.body) first.focus();
+    $('grid').innerHTML = items.map(card).join('');
+    focusFirst($('grid'));
   }
-  var account = false;
+  function row(title) {
+    var sec = document.createElement('section'); sec.className = 'tv-row';
+    sec.innerHTML = '<h2>' + esc(title) + '</h2><div class="tv-strip">' + skeleton(6) + '</div>';
+    $('rows').appendChild(sec);
+    return {fill: function (items) {
+      if (!items.length) { sec.remove(); return; }
+      sec.lastChild.innerHTML = items.map(card).join('');
+      focusFirst($('rows'));
+    }, drop: function () { sec.remove(); }};
+  }
   function loadHome() {
-    status('Loading…');
-    if (account) {   // signed in: your own YouTube subscriptions feed
-      Promise.all([api('feed?name=subs'), api('history')]).then(function (r) {
-        var resume = (r[1].items || []).filter(function (v) { return v.position && v.duration && v.position < v.duration - 30; }).slice(0, 8);
-        show(resume.length ? 'Continue watching · Your subscriptions' : 'Your subscriptions', resume.concat(r[0].items || []));
-      }).catch(function (e) { status(e.message); });
-      return;
-    }
-    Promise.all([api('home'), api('history')]).then(function (r) {
-      subs = r[0].subscriptions || [];
-      var resume = (r[1].items || []).filter(function (v) { return v.position && v.duration && v.position < v.duration - 30; }).slice(0, 8);
-      var items = resume.concat(r[0].items || []);
-      show(resume.length ? 'Continue watching · Subscriptions' : 'Subscriptions', items,
-        items.length ? '' : 'Search for something, open a video and choose "Subscribe" to fill this page.');
-    }).catch(function (e) { status(e.message); });
+    tab('homeBtn');
+    $('list').hidden = true; $('rows').hidden = false; $('rows').innerHTML = '';
+    status('');
+    var cont = row('Continue watching');
+    api('history').then(function (h) {
+      cont.fill((h.items || []).filter(function (v) { return v.position && v.duration && v.position < v.duration - 30; }).slice(0, 12));
+    }).catch(cont.drop);
+    var subsRow = row(account ? 'Your subscriptions' : 'Subscriptions');
+    (account ? api('feed?name=subs') : api('home')).then(function (d) {
+      if (d.subscriptions) subs = d.subscriptions;
+      subsRow.fill(d.items || []);
+    }).catch(subsRow.drop);
+    TOPICS.forEach(function (t) {   // filled as each search returns (cached for an hour on the board)
+      var r = row(t[0]);
+      api('search?q=' + encodeURIComponent(t[1]) + '&topic=1').then(function (d) { r.fill((d.items || []).slice(0, 16)); }).catch(r.drop);
+    });
   }
   function search(q) {
     if (!q.trim()) return;
     status('Searching…');
+    tab(null);
     api('search?q=' + encodeURIComponent(q)).then(function (d) { show('Results for "' + q + '"', d.items); }).catch(function (e) { status(e.message); });
   }
   function openChannel(id, name) {
@@ -106,7 +123,7 @@
     if (hls) { hls.destroy(); hls = null; }
     video.removeAttribute('src'); video.load();
     $('player').hidden = true;
-    var card = current && $('grid').querySelector('[data-id="' + current.id + '"]');
+    var card = current && document.querySelector('.tv-card[data-id="' + current.id + '"]');
     current = null;
     (card || $('q')).focus();
   }
@@ -153,7 +170,14 @@
       var score = main + side * 2.5;
       if (score < bestScore) { bestScore = score; best = n; }
     });
-    if (best) { best.focus(); best.scrollIntoView({block: 'nearest', behavior: 'smooth'}); }
+    if (best) {
+      best.focus({preventScroll: true});
+      best.scrollIntoView({block: 'nearest', inline: 'nearest', behavior: 'smooth'});
+      if (best.classList.contains('tv-card') && best.closest('.tv-row')) {   // keep the row and its title in view
+        var rowTop = best.closest('.tv-row').getBoundingClientRect().top;
+        if (rowTop < 140) window.scrollBy({top: rowTop - 150, behavior: 'smooth'});
+      }
+    }
   }
   document.addEventListener('keydown', function (e) {
     var k = e.keyCode, inPlayer = !$('player').hidden, video = $('video');
@@ -173,12 +197,12 @@
     if (dirs[k]) { e.preventDefault(); move(dirs[k]); return; }
     if (k === 13 && document.activeElement && document.activeElement.dataset && document.activeElement.dataset.id) { e.preventDefault(); play(document.activeElement.dataset.id); }
   });
-  $('grid').addEventListener('click', function (e) { var c = e.target.closest('[data-id]'); if (c) play(c.dataset.id); });
+  document.addEventListener('click', function (e) { var c = e.target.closest('.tv-card[data-id]'); if (c) play(c.dataset.id); });
   $('searchForm').addEventListener('submit', function (e) { e.preventDefault(); search($('q').value); });
   $('homeBtn').addEventListener('click', loadHome);
-  $('historyBtn').addEventListener('click', function () { api('history').then(function (d) { show('History', d.items); }); });
-  $('laterBtn').addEventListener('click', function () { api(account ? 'feed?name=later' : 'later').then(function (d) { show('Watch Later', d.items); }).catch(function (e) { status(e.message); }); });
-  $('recBtn').addEventListener('click', function () { status('Loading recommendations…'); api('feed?name=rec').then(function (d) { show('Recommended', d.items); }).catch(function (e) { status(e.message); }); });
+  $('historyBtn').addEventListener('click', function () { tab('historyBtn'); api('history').then(function (d) { show('History', d.items); }); });
+  $('laterBtn').addEventListener('click', function () { tab('laterBtn'); api(account ? 'feed?name=later' : 'later').then(function (d) { show('Watch Later', d.items); }).catch(function (e) { status(e.message); }); });
+  $('recBtn').addEventListener('click', function () { tab('recBtn'); status('Loading recommendations…'); api('feed?name=rec').then(function (d) { show('Recommended', d.items); }).catch(function (e) { status(e.message); }); });
   $('closeBtn').addEventListener('click', closePlayer);
   $('subBtn').addEventListener('click', function () {
     if (!current || !current.channel_id) return;
@@ -220,5 +244,24 @@
     installSays('This TV has no app-install function in its browser. Add /tv as a bookmark or favourite instead, and open it full screen.');
   });
 
+
+  // ---- what this TV's browser can do: sent once to the board so install and developer-mode
+  // questions are answered by measurement. Function names, screen and codec support only.
+  function report() {
+    try {
+      var names = [];
+      for (var k in window) { if (/hisense|vidaa|omi|oipf|hbbtv|tizen|webos|netcast|jsbridge|native|devmode|debug|install/i.test(k)) names.push(k + ':' + typeof window[k]); }
+      Object.getOwnPropertyNames(window).forEach(function (k) { if (/hisense|vidaa|omi|oipf|hbbtv|install|debug/i.test(k) && names.indexOf(k + ':' + typeof window[k]) < 0) names.push(k + ':' + typeof window[k]); });
+      var ms = window.MediaSource || window.WebKitMediaSource;
+      var codecs = {};
+      ['video/mp4; codecs="avc1.64001F"', 'video/mp4; codecs="avc1.640028"', 'video/webm; codecs="vp9"', 'video/mp4; codecs="av01.0.08M.08"', 'audio/mp4; codecs="mp4a.40.2"', 'audio/webm; codecs="opus"']
+        .forEach(function (c) { codecs[c] = !!(ms && ms.isTypeSupported && ms.isTypeSupported(c)); });
+      var body = {ua: navigator.userAgent.slice(0, 300), w: window.innerWidth, h: window.innerHeight, dpr: window.devicePixelRatio,
+                  sw: screen.width, sh: screen.height, names: names.slice(0, 200), mse: !!ms, hlsNative: !!document.createElement('video').canPlayType('application/vnd.apple.mpegurl'),
+                  hlsjs: !!(window.Hls && window.Hls.isSupported()), sw_api: 'serviceWorker' in navigator, codecs: codecs};
+      fetch('/api/tv/diag', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)}).catch(function () {});
+    } catch (e) { /* never block the page */ }
+  }
+  report();
   api('account').then(function (d) { account = !!d.connected; $('recBtn').hidden = !account; }).catch(function () {}).then(loadHome);
 })();

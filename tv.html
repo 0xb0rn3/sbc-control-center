@@ -12,21 +12,28 @@
 </head>
 <body>
 <header class="tv-top">
-  <div class="tv-brand">YouTube <span>· no ads · through your VPN</span></div>
-  <form id="searchForm" class="tv-search" autocomplete="off">
-    <input id="q" type="search" placeholder="Search YouTube" data-nav aria-label="Search YouTube">
-    <button type="submit" data-nav>Search</button>
-    <button type="button" id="homeBtn" data-nav>Home</button>
+  <div class="tv-bar">
+    <div class="tv-brand"><span class="tv-logo" aria-hidden="true"></span>YouTube<small>no ads · through your VPN</small></div>
+    <form id="searchForm" class="tv-search" autocomplete="off">
+      <input id="q" type="search" placeholder="Search YouTube" data-nav aria-label="Search YouTube">
+      <button type="submit" data-nav>Search</button>
+    </form>
+  </div>
+  <nav class="tv-tabs" aria-label="Sections">
+    <button type="button" id="homeBtn" data-nav class="on">Home</button>
+    <button type="button" id="recBtn" data-nav hidden>Recommended</button>
     <button type="button" id="historyBtn" data-nav>History</button>
     <button type="button" id="laterBtn" data-nav>Watch Later</button>
-    <button type="button" id="recBtn" data-nav hidden>Recommended</button>
-    <button type="button" id="installBtn" data-nav>Add to TV home</button>
-  </form>
+    <button type="button" id="installBtn" data-nav class="tv-install">Add to TV home</button>
+  </nav>
 </header>
 <main>
-  <h2 id="rowTitle">Subscriptions</h2>
-  <p id="status" class="tv-status">Loading…</p>
-  <section id="grid" class="tv-grid" aria-live="polite"></section>
+  <p id="status" class="tv-status" aria-live="polite">Loading…</p>
+  <div id="rows" class="tv-rows"></div>
+  <section id="list" class="tv-list" hidden>
+    <h2 id="rowTitle"></h2>
+    <div id="grid" class="tv-grid"></div>
+  </section>
 </main>
 <div id="player" class="tv-player" hidden>
   <video id="video" playsinline></video>

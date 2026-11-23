@@ -41,6 +41,7 @@ CHANNEL_ID = re.compile(r'UC[A-Za-z0-9_-]{22}')
 _cache: dict[str, tuple[float, Any]] = {}
 _lock = threading.Lock()
 _slots = threading.BoundedSemaphore(3)   # at most three extractions at once on a small board
+_background = threading.BoundedSemaphore(2)   # home-page topic rows use two of them at most: one stays free for you
 _caption_urls: dict[str, dict[tuple[str, bool], str]] = {}
 COOKIES = STATE / 'cookies.txt'
 ACCOUNT_FEEDS = {'subs': ':ytsubs', 'rec': ':ytrec', 'later': ':ytwatchlater', 'history': ':ythistory'}
@@ -90,12 +91,16 @@ def _thumb(video_id: str) -> str:
     return f'https://i.ytimg.com/vi/{video_id}/hqdefault.jpg'
 
 
-def search(query: str, count: int = 24) -> list[dict[str, Any]]:
+def search(query: str, count: int = 24, ttl: float = 600, background: bool = False) -> list[dict[str, Any]]:
     query = query.strip()[:120]
     if not query:
         return []
     def make():
-        data = _ytdlp([f'ytsearch{count}:{query}', '--flat-playlist'])
+        if background:
+            with _background:
+                data = _ytdlp([f'ytsearch{count}:{query}', '--flat-playlist'])
+        else:
+            data = _ytdlp([f'ytsearch{count}:{query}', '--flat-playlist'])
         out = []
         for e in data.get('entries') or []:
             vid = e.get('id') or ''
@@ -104,7 +109,7 @@ def search(query: str, count: int = 24) -> list[dict[str, Any]]:
                             'channel_id': e.get('channel_id') if CHANNEL_ID.fullmatch(str(e.get('channel_id') or '')) else None,
                             'duration': e.get('duration'), 'views': e.get('view_count'), 'thumb': _thumb(vid)})
         return out
-    return _cached(f's:{query}:{count}', 600, make)
+    return _cached(f's:{query}:{count}', ttl, make)
 
 
 def video(video_id: str) -> dict[str, Any]:
@@ -303,7 +308,10 @@ class Handler(BaseHTTPRequestHandler):
         q = {k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}
         try:
             if url.path == '/search':
-                self.reply(200, {'ok': True, 'items': search(q.get('q', ''))})
+                # the home page's topic rows change slowly: keep them an hour
+                self.reply(200, {'ok': True, 'items': search(q.get('q', ''), ttl=3600 if q.get('topic') == '1' else 600, background=q.get('topic') == '1')})
+            elif url.path == '/diag':
+                self.reply(200, {'ok': True, 'reports': get_list('diag')})
             elif url.path == '/video':
                 self.reply(200, {'ok': True, **video(q.get('id', ''))})
             elif url.path == '/channel':
@@ -339,6 +347,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, {'ok': True, 'items': put_item(url.path[1:], data.get('item') or {}, bool(data.get('remove')))})
             elif url.path == '/cookies':
                 self.reply(200, {'ok': True, **(clear_cookies() if data.get('clear') else set_cookies(data.get('text', '')))})
+            elif url.path == '/diag':
+                # what a TV's browser can do (function names, screen, codecs): kept for diagnosis, last 5
+                clean = {k: data.get(k) for k in ('ua', 'w', 'h', 'dpr', 'sw', 'sh', 'names', 'mse', 'hlsNative', 'hlsjs', 'sw_api', 'codecs')}
+                clean['at'] = int(time.time())
+                items = [clean] + get_list('diag')[:4]
+                _durable_write(_list_path('diag'), json.dumps(items)[:60000])
+                self.reply(200, {'ok': True})
             elif url.path == '/takeout':
                 self.reply(200, {'ok': True, 'subscriptions': import_takeout(str(data.get('csv', ''))[:200_000])})
             else:

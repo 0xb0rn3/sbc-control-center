@@ -1427,7 +1427,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        if path in ('/api/tv/subscribe', '/api/tv/history', '/api/tv/later', '/api/tv/takeout'):
+        if path in ('/api/tv/subscribe', '/api/tv/history', '/api/tv/later', '/api/tv/takeout', '/api/tv/diag'):
             if not tube_allowed(client_ip(self)):
                 self.send_json(429, {'ok': False, 'error': 'Too many requests; wait a minute.'})
                 return
@@ -1436,7 +1436,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_json(400, {'ok': False, 'error': str(exc)})
                 return
-            status, body = tube_request('/' + path[8:], json.dumps({k: data.get(k) for k in ('id', 'name', 'add', 'item', 'remove', 'csv')}).encode())
+            keys = ('ua', 'w', 'h', 'dpr', 'sw', 'sh', 'names', 'mse', 'hlsNative', 'hlsjs', 'sw_api', 'codecs') if path.endswith('/diag') else ('id', 'name', 'add', 'item', 'remove', 'csv')
+            status, body = tube_request('/' + path[8:], json.dumps({k: data.get(k) for k in keys}).encode())
             self.send_response(status)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(body)))
