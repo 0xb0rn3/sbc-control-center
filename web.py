@@ -1137,6 +1137,17 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if path == '/tv.webmanifest':
+            manifest = json.dumps({'name': f'{DEVICE_LABEL} · YouTube', 'short_name': 'YouTube', 'start_url': '/tv',
+                                   'display': 'fullscreen', 'orientation': 'landscape', 'background_color': '#0c0d10', 'theme_color': '#0c0d10',
+                                   'icons': [{'src': '/assets/ui/tv-icon.png', 'sizes': '256x256', 'type': 'image/png'}]}).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/manifest+json')
+            self.send_header('Content-Length', str(len(manifest)))
+            self.security_headers(cache='public, max-age=3600')
+            self.end_headers()
+            self.wfile.write(manifest)
+            return
         if path in ('/standby', '/living-room'):
             try:
                 body = STANDBY_PATH.read_bytes()
