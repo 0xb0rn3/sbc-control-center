@@ -90,7 +90,13 @@
         hls = new window.Hls({maxBufferLength: 30});
         hls.loadSource(v.hls);
         hls.attachMedia(video);
-        hls.on(window.Hls.Events.MANIFEST_PARSED, function () { fillQuality(); start(); });
+        hls.on(window.Hls.Events.MANIFEST_PARSED, function () {
+          fillQuality();
+          // always the highest quality: lock to the top level (hls.js sorts levels by bitrate)
+          var top = hls.levels.length - 1;
+          if (top >= 0) { hls.currentLevel = top; $('qSel').value = String(top); }
+          start();
+        });
         hls.on(window.Hls.Events.ERROR, function (_e, data) { if (data.fatal) { status('Playback error: ' + data.details); } });
       } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
         video.src = v.hls; video.addEventListener('loadedmetadata', start, {once: true});

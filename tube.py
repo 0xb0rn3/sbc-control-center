@@ -12,10 +12,14 @@ and is updated daily, because YouTube changes often.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import http.client
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import threading
@@ -208,62 +212,10 @@ def search(query: str, count: int = 24, ttl: float = 600, background: bool = Fal
     return _cached(f's:{query}:{count}', ttl, make)
 
 
-TVHTML5_CLIENT = {'clientName': 'TVHTML5', 'clientVersion': '7.20250101.00.00',
-                  'hl': 'en', 'gl': 'US', 'platform': 'TV', 'clientScreen': 'WATCH'}
-
-
-def video_direct(video_id: str) -> dict[str, Any] | None:
-    """YouTube's player endpoint as a TV client: returns an HLS master manifest in H.264 + AAC,
-    which every smart-TV browser plays. About a second; no yt-dlp subprocess."""
-    body = json.dumps({'context': {'client': TVHTML5_CLIENT}, 'videoId': video_id,
-                       'contentCheckOk': True, 'racyCheckOk': True}).encode()
-    data = json.loads(_https('www.youtube.com', 'POST', '/youtubei/v1/player?prettyPrint=false',
-                             body, {'Content-Type': 'application/json'}))
-    streaming = data.get('streamingData') or {}
-    hls = streaming.get('hlsManifestUrl')
-    if not hls:
-        return None
-    details = data.get('videoDetails') or {}
-    micro = ((data.get('microformat') or {}).get('playerMicroformatRenderer') or {})
-    captions_tracks = (((data.get('captions') or {}).get('playerCaptionsTracklistRenderer') or {}).get('captionTracks') or [])
-    subs = []
-    for t in captions_tracks[:30]:
-        lang = str(t.get('languageCode') or '')
-        if not re.fullmatch(r'[A-Za-z0-9_-]{1,20}', lang):
-            continue
-        name = _text(t.get('name')) or lang
-        auto = (t.get('kind') == 'asr')
-        subs.append({'lang': lang, 'name': name[:40] + (' (auto)' if auto else ''), 'auto': auto, '_url': t.get('baseUrl')})
-    # capture caption URLs for later /captions requests; strip the private field from the reply
-    _caption_urls[video_id] = {(s['lang'], s['auto']): s['_url'] for s in subs if s.get('_url')}
-    try:
-        duration = int(details.get('lengthSeconds') or 0) or None
-    except ValueError:
-        duration = None
-    try:
-        views = int(details.get('viewCount') or 0) or None
-    except ValueError:
-        views = None
-    return {'id': video_id, 'title': str(details.get('title') or '')[:200],
-            'channel': str(details.get('author') or '')[:80],
-            'channel_id': details.get('channelId') if CHANNEL_ID.fullmatch(str(details.get('channelId') or '')) else None,
-            'duration': duration, 'views': views, 'thumb': _thumb(video_id),
-            'hls': hls, 'live': bool(details.get('isLive')) or bool(details.get('isLiveContent')),
-            'description': str(details.get('shortDescription') or micro.get('description', {}).get('simpleText') or '')[:600],
-            'subtitles': [{k: v for k, v in s.items() if not k.startswith('_')} for s in subs],
-            'chapters': []}
-
-
 def video(video_id: str) -> dict[str, Any]:
     if not VIDEO_ID.fullmatch(video_id or ''):
         raise ValueError('not a video id')
     def make():
-        try:   # TVHTML5 client first: about a second, H.264 HLS every TV plays
-            tv = video_direct(video_id)
-            if tv and tv.get('hls'):
-                return tv
-        except Exception:
-            pass
         d = _ytdlp([f'https://www.youtube.com/watch?v={video_id}'])
         formats = d.get('formats') or []
         hls = [f for f in formats if str(f.get('protocol', '')).startswith('m3u8')]
@@ -285,6 +237,111 @@ def video(video_id: str) -> dict[str, Any]:
                 'description': str(d.get('description') or '')[:600]}
     # stream addresses stay valid for a few hours; keep them two
     return _cached(f'v:{video_id}', 7200, make)
+
+
+# ---- stream relay
+# googlevideo sends no CORS headers, so a page served by this board cannot read the playlists or
+# segments itself (hls.js then shows a black picture). The portal relays them instead: every address
+# handed to the TV is a signed /api/tv/hls link, fetched here through the tunnel (the IP the stream
+# is bound to), and nothing else can be fetched through it.
+RELAY_PATH = '/api/tv/hls'
+RELAY_HOST = re.compile(r'(?:[a-z0-9-]+\.)+googlevideo\.com')
+_URI_ATTR = re.compile(r'URI="([^"]+)"')
+_relay_key: bytes | None = None
+
+
+def _key() -> bytes:
+    """Signing key for relay links, kept across restarts so a playing video survives one."""
+    global _relay_key
+    if _relay_key is None:
+        path = STATE / 'relay.key'
+        try:
+            key = path.read_bytes()
+        except OSError:
+            key = b''
+        if len(key) != 32:
+            key = secrets.token_bytes(32)
+            STATE.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name('.relay.key')
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'wb') as handle:
+                handle.write(key)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        _relay_key = key
+    return _relay_key
+
+
+def _sign(url: str) -> str:
+    return hmac.new(_key(), url.encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def relay_link(url: str) -> str:
+    token = base64.urlsafe_b64encode(url.encode()).decode().rstrip('=')
+    return f'{RELAY_PATH}?u={token}&s={_sign(url)}'
+
+
+def relay_target(token: str, signature: str) -> str:
+    """The stream address behind a relay link, only if this service signed it and it is googlevideo."""
+    try:
+        url = base64.urlsafe_b64decode(token + '=' * (-len(token) % 4)).decode()
+    except (ValueError, UnicodeDecodeError):
+        raise ValueError('bad relay link') from None
+    if not hmac.compare_digest(_sign(url), signature or ''):
+        raise ValueError('bad relay link')
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != 'https' or not RELAY_HOST.fullmatch(parts.hostname or ''):
+        raise ValueError('not a stream address')
+    return url
+
+
+def rewrite_playlist(text: str, base: str, h264_only: bool = False) -> str:
+    """Point every address in an HLS playlist at the relay. With h264_only, a master playlist keeps
+    only its H.264 variants (when it has any): smart-TV browsers often cannot decode VP9."""
+    lines = [line.strip() for line in text.splitlines()]
+    keep_avc = h264_only and any(l.startswith('#EXT-X-STREAM-INF') and 'avc1' in l for l in lines)
+    out: list[str] = []
+    skip_uri = False
+    for line in lines:
+        if not line:
+            continue
+        if line.startswith('#'):
+            if keep_avc and line.startswith(('#EXT-X-STREAM-INF', '#EXT-X-I-FRAME-STREAM-INF')) and 'avc1' not in line:
+                skip_uri = line.startswith('#EXT-X-STREAM-INF')
+                continue
+            out.append(_URI_ATTR.sub(lambda m: f'URI="{relay_link(urllib.parse.urljoin(base, m.group(1)))}"', line))
+        elif skip_uri:
+            skip_uri = False
+        else:
+            out.append(relay_link(urllib.parse.urljoin(base, line)))
+    return '\n'.join(out) + '\n'
+
+
+def _open_stream(url: str, range_header: str | None = None):
+    headers = {'User-Agent': UA}
+    if range_header and re.fullmatch(r'bytes=\d{0,15}-\d{0,15}', range_header):
+        headers['Range'] = range_header
+    resp = urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30)
+    final = urllib.parse.urlsplit(resp.geturl())
+    if final.scheme != 'https' or not RELAY_HOST.fullmatch(final.hostname or ''):
+        resp.close()
+        raise ValueError('stream redirected off googlevideo')
+    return resp
+
+
+def stream_master(video_id: str) -> str:
+    """The video's HLS master playlist, H.264 only, every address through the relay."""
+    master = video(video_id).get('hls')
+    if not master:
+        raise ValueError('No playable stream for this video.')
+    with _open_stream(master) as resp:
+        return rewrite_playlist(resp.read(4_000_000).decode('utf-8', 'replace'), resp.geturl(), h264_only=True)
+
+
+def _is_playlist(resp, url: str) -> bool:
+    ctype = (resp.headers.get('Content-Type') or '').lower()
+    return 'mpegurl' in ctype or urllib.parse.urlsplit(url).path.endswith('.m3u8')
 
 
 def channel(channel_id: str) -> list[dict[str, Any]]:
@@ -490,6 +547,33 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_bytes(self, status: int, body: bytes, ctype: str) -> None:
+        self.send_response(status)
+        self.send_header('Content-Type', ctype)
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(body)
+
+    def relay(self, target: str) -> None:
+        """A playlist comes back rewritten; anything else (segments) streams through as it arrives."""
+        with _open_stream(target, self.headers.get('Range')) as resp:
+            if _is_playlist(resp, resp.geturl()):
+                text = rewrite_playlist(resp.read(4_000_000).decode('utf-8', 'replace'), resp.geturl())
+                self.send_bytes(200, text.encode(), 'application/vnd.apple.mpegurl')
+                return
+            self.send_response(resp.status)
+            for name in ('Content-Type', 'Content-Length', 'Content-Range', 'Accept-Ranges'):
+                if resp.headers.get(name):
+                    self.send_header(name, resp.headers[name])
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            try:
+                while chunk := resp.read(65536):
+                    self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass   # the TV skipped ahead or closed the video
+
     def do_GET(self) -> None:
         url = urllib.parse.urlparse(self.path)
         q = {k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}
@@ -500,7 +584,14 @@ class Handler(BaseHTTPRequestHandler):
             elif url.path == '/diag':
                 self.reply(200, {'ok': True, 'reports': get_list('diag')})
             elif url.path == '/video':
-                self.reply(200, {'ok': True, **video(q.get('id', ''))})
+                v = video(q.get('id', ''))
+                # the TV gets the relay's playlist, never the googlevideo address (which it cannot read)
+                relay = f"/api/tv/stream?id={v['id']}" if v.get('hls') else None
+                self.reply(200, {'ok': True, **v, 'hls': relay})
+            elif url.path == '/stream':
+                self.send_bytes(200, stream_master(q.get('id', '')).encode(), 'application/vnd.apple.mpegurl')
+            elif url.path == '/hls':
+                self.relay(relay_target(q.get('u', ''), q.get('s', '')))
             elif url.path == '/channel':
                 self.reply(200, {'ok': True, 'items': channel(q.get('id', ''))})
             elif url.path == '/home':

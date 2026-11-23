@@ -679,6 +679,34 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def relay_tube(self, path: str) -> None:
+        """Stream a TV playlist or video segment from the tube service as it arrives (a 1080p segment
+        is several MB, so it is never held in memory whole)."""
+        headers = {}
+        rng = self.headers.get('Range', '')
+        if re.fullmatch(r'bytes=\d{0,15}-\d{0,15}', rng):
+            headers['Range'] = rng
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            resp = opener.open(urllib.request.Request(TUBE_URL + path, headers=headers), timeout=40)
+        except urllib.error.HTTPError as exc:
+            resp = exc
+        except Exception:
+            self.send_json(503, {'ok': False, 'error': 'The YouTube service is not running.'})
+            return
+        with resp:
+            self.send_response(resp.status)
+            for name in ('Content-Type', 'Content-Length', 'Content-Range', 'Accept-Ranges'):
+                if resp.headers.get(name):
+                    self.send_header(name, resp.headers[name])
+            self.security_headers()
+            self.end_headers()
+            try:
+                while chunk := resp.read(65536):
+                    self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError, TimeoutError):
+                pass   # the TV skipped ahead or closed the video
+
     def same_origin_request(self) -> bool:
         host = self.headers.get('Host', '')
         if not local_host_header_allowed(host):
@@ -1124,6 +1152,13 @@ class Handler(BaseHTTPRequestHandler):
             self.security_headers(secrets.token_urlsafe(18), media=True)
             self.end_headers()
             self.wfile.write(body)
+            return
+        if path in ('/api/tv/stream', '/api/tv/hls'):
+            # playback makes a request every few seconds: its own, larger allowance per address
+            if not tube_allowed('hls:' + client_ip(self), limit=1200):
+                self.send_json(429, {'ok': False, 'error': 'Too many requests; wait a minute.'})
+                return
+            self.relay_tube('/' + path[8:] + ('?' + parsed.query if parsed.query else ''))
             return
         if path.startswith('/api/tv/') and path[8:] in ('search', 'video', 'channel', 'home', 'history', 'later', 'captions', 'account', 'feed'):
             if not tube_allowed(client_ip(self)):

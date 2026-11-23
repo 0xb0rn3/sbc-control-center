@@ -1,8 +1,13 @@
 import io
 import json
+import re
 import shutil
 import tempfile
+import threading
 import unittest
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -34,7 +39,7 @@ class TubeTests(unittest.TestCase):
                 'formats': [{'protocol': 'https', 'url': 'https://x/a'}, {'protocol': 'm3u8_native', 'url': 'https://x/v.m3u8', 'manifest_url': 'https://x/master.m3u8', 'height': 720}],
                 'subtitles': {'de': [{'ext': 'vtt', 'url': 'https://x/de.vtt', 'name': 'German'}]},
                 'automatic_captions': {'en': [{'ext': 'vtt', 'url': 'https://x/en.vtt'}], 'fr': [{'ext': 'vtt', 'url': 'https://x/fr.vtt'}]}}
-        with mock.patch.object(tube, 'video_direct', return_value=None), mock.patch.object(tube, '_ytdlp', return_value=fake):
+        with mock.patch.object(tube, '_ytdlp', return_value=fake):
             v = tube.video('jNQXAC9IVRw')
         self.assertEqual(v['hls'], 'https://x/master.m3u8')
         self.assertEqual(sorted(s['lang'] for s in v['subtitles']), ['de', 'en'])   # auto captions: English only here
@@ -70,26 +75,6 @@ class TubeTests(unittest.TestCase):
             tube.clear_cookies()
             self.assertFalse((self.tmp / 'cookies.txt').exists())
 
-    def test_video_prefers_the_tv_client(self):
-        player = {'streamingData': {'hlsManifestUrl': 'https://x/tv/master.m3u8'},
-                  'videoDetails': {'title': 'Me at the zoo', 'author': 'jawed', 'channelId': 'UC4QobU6STFB0P71PMvOGN5A',
-                                   'lengthSeconds': '19', 'viewCount': '1000'},
-                  'captions': {'playerCaptionsTracklistRenderer': {'captionTracks': [
-                      {'languageCode': 'en', 'name': {'simpleText': 'English'}, 'kind': 'asr', 'baseUrl': 'https://x/tt?lang=en'},
-                      {'languageCode': '../x', 'baseUrl': 'https://x/bad'}]}}}
-        ytdlp = mock.Mock(side_effect=AssertionError('yt-dlp must not run when the TV client answers'))
-        with mock.patch.object(tube, '_https', return_value=json.dumps(player).encode()), mock.patch.object(tube, '_ytdlp', ytdlp):
-            v = tube.video('jNQXAC9IVRw')
-        self.assertEqual(v['hls'], 'https://x/tv/master.m3u8')
-        self.assertEqual((v['duration'], v['views'], v['channel']), (19, 1000, 'jawed'))
-        self.assertEqual(v['subtitles'], [{'lang': 'en', 'name': 'English (auto)', 'auto': True}])   # no private URL leaks
-        self.assertEqual(tube._caption_urls['jNQXAC9IVRw'], {('en', True): 'https://x/tt?lang=en'})
-
-    def test_video_falls_back_to_ytdlp_without_tv_hls(self):
-        fake = {'title': 't', 'formats': [{'protocol': 'm3u8_native', 'url': 'https://x/v.m3u8', 'manifest_url': 'https://x/master.m3u8'}]}
-        with mock.patch.object(tube, '_https', side_effect=OSError('offline')), mock.patch.object(tube, '_ytdlp', return_value=fake):
-            self.assertEqual(tube.video('jNQXAC9IVRw')['hls'], 'https://x/master.m3u8')
-
     def test_timedtext_becomes_webvtt(self):
         xml = b'<?xml version="1.0"?><transcript><text start="0.5" dur="2">Hello &amp;amp; welcome</text>' \
               b'<text start="3661.25" dur="1.5">late\nline</text><text start="x">bad</text><text start="9" dur="1"> </text></transcript>'
@@ -110,6 +95,136 @@ class TubeTests(unittest.TestCase):
         with mock.patch.object(tube.urllib.request, 'urlopen', fake_urlopen):
             self.assertEqual(tube.captions('jNQXAC9IVRw', 'en', False), 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nhi\n')
             self.assertTrue(tube.captions('jNQXAC9IVRw', 'de', False).startswith('WEBVTT\n\n00:00:01.000'))
+
+
+MASTER = """#EXTM3U
+#EXT-X-INDEPENDENT-SEGMENTS
+#EXT-X-STREAM-INF:BANDWIDTH=9000000,CODECS="vp09.00.51.08,mp4a.40.2",RESOLUTION=3840x2160
+https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/315/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=4500000,CODECS="avc1.640028,mp4a.40.2",RESOLUTION=1920x1080
+https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/96/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=1500000,CODECS="avc1.4d401f,mp4a.40.2",RESOLUTION=1280x720
+https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/95/index.m3u8
+"""
+VARIANT = """#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:6
+#EXT-X-MAP:URI="init.mp4"
+#EXTINF:5.0,
+https://rr2---sn-abc.googlevideo.com/videoplayback/id/1/sq/0/file/seg.ts
+#EXTINF:5.0,
+seg1.ts
+#EXT-X-ENDLIST
+"""
+
+
+class FakeResponse:
+    def __init__(self, url, body, ctype, status=200):
+        self.url, self.body, self.status = url, io.BytesIO(body), status
+        self.headers = {'Content-Type': ctype, 'Content-Length': str(len(body))}
+
+    def read(self, n=-1):
+        return self.body.read(n)
+
+    def geturl(self):
+        return self.url
+
+    def close(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class RelayTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.p = mock.patch.object(tube, 'STATE', self.tmp)
+        self.p.start()
+        tube._relay_key = None
+        tube._cache.clear()
+
+    def tearDown(self):
+        self.p.stop()
+        tube._relay_key = None
+        shutil.rmtree(self.tmp)
+
+    def _target(self, link):
+        q = urllib.parse.parse_qs(urllib.parse.urlsplit(link).query)
+        return tube.relay_target(q['u'][0], q['s'][0])
+
+    def test_links_round_trip_and_reject_tampering(self):
+        url = 'https://rr2---sn-abc.googlevideo.com/videoplayback?id=1&itag=96'
+        link = tube.relay_link(url)
+        self.assertTrue(link.startswith('/api/tv/hls?u='))
+        self.assertEqual(self._target(link), url)
+        self.assertEqual((self.tmp / 'relay.key').stat().st_mode & 0o777, 0o600)
+        q = urllib.parse.parse_qs(urllib.parse.urlsplit(link).query)
+        with self.assertRaises(ValueError):
+            tube.relay_target(q['u'][0], '0' * 32)                       # forged signature
+        with self.assertRaises(ValueError):
+            self._target(tube.relay_link('https://evil.example/x'))      # signed but not googlevideo
+        with self.assertRaises(ValueError):
+            self._target(tube.relay_link('http://rr1.googlevideo.com/x'))  # not https
+        with self.assertRaises(ValueError):
+            tube.relay_target('!!!', 'x')
+
+    def test_master_keeps_h264_only_and_relays_every_address(self):
+        out = tube.rewrite_playlist(MASTER, 'https://manifest.googlevideo.com/api/manifest/hls_variant/x', h264_only=True)
+        self.assertNotIn('vp09', out)
+        self.assertEqual(out.count('#EXT-X-STREAM-INF'), 2)
+        self.assertNotIn('googlevideo', out)
+        uris = [l for l in out.splitlines() if not l.startswith('#')]
+        self.assertEqual([self._target(u).split('/itag/')[1] for u in uris], ['96/index.m3u8', '95/index.m3u8'])
+        # without any H.264 variant the master is kept whole rather than emptied
+        vp9_only = MASTER.split('#EXT-X-STREAM-INF:BANDWIDTH=4500000')[0]
+        self.assertEqual(tube.rewrite_playlist(vp9_only, 'https://manifest.googlevideo.com/', h264_only=True).count('#EXT-X-STREAM-INF'), 1)
+
+    def test_variant_relative_and_attribute_addresses(self):
+        base = 'https://rr2---sn-abc.googlevideo.com/videoplayback/id/1/index.m3u8'
+        out = tube.rewrite_playlist(VARIANT, base)
+        self.assertIn('#EXT-X-ENDLIST', out)
+        m = re.search(r'URI="([^"]+)"', out)
+        self.assertEqual(self._target(m.group(1)), 'https://rr2---sn-abc.googlevideo.com/videoplayback/id/1/init.mp4')
+        segs = [self._target(l) for l in out.splitlines() if not l.startswith('#')]
+        self.assertEqual(segs, ['https://rr2---sn-abc.googlevideo.com/videoplayback/id/1/sq/0/file/seg.ts',
+                                'https://rr2---sn-abc.googlevideo.com/videoplayback/id/1/seg1.ts'])
+
+    def test_handler_serves_relay_end_to_end(self):
+        master_url = 'https://manifest.googlevideo.com/api/manifest/hls_variant/id/1'
+        segment = b'\x47' + b'\x00' * 187 * 3
+        seg_url = 'https://rr2---sn-abc.googlevideo.com/videoplayback/sq/0/file/seg.ts'
+        def fake_open(url, range_header=None):
+            if url == master_url:
+                return FakeResponse(url, MASTER.encode(), 'application/vnd.apple.mpegurl')
+            if url == seg_url:
+                return FakeResponse(url, segment, 'application/octet-stream')
+            raise AssertionError(url)
+        server = tube.ThreadingHTTPServer(('127.0.0.1', 0), tube.Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        base = f'http://127.0.0.1:{server.server_address[1]}'
+        get = lambda path: urllib.request.build_opener(urllib.request.ProxyHandler({})).open(base + path, timeout=10)
+        try:
+            with mock.patch.object(tube, 'video', return_value={'id': 'jNQXAC9IVRw', 'hls': master_url, 'title': 't'}), \
+                 mock.patch.object(tube, '_open_stream', side_effect=fake_open):
+                v = json.loads(get('/video?id=jNQXAC9IVRw').read())
+                self.assertEqual(v['hls'], '/api/tv/stream?id=jNQXAC9IVRw')          # the TV never sees googlevideo
+                with get('/stream?id=jNQXAC9IVRw') as r:
+                    self.assertEqual(r.headers['Content-Type'], 'application/vnd.apple.mpegurl')
+                    body = r.read().decode()
+                self.assertNotIn('vp09', body)
+                link = tube.relay_link(seg_url)
+                with get(link[len('/api/tv'):]) as r:
+                    self.assertEqual(r.read(), segment)
+                with self.assertRaises(urllib.error.HTTPError) as bad:
+                    get('/hls?u=' + link.split('u=')[1].split('&')[0] + '&s=' + '0' * 32)
+                self.assertEqual(bad.exception.code, 502)
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == '__main__':
