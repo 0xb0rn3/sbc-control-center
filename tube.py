@@ -12,6 +12,7 @@ and is updated daily, because YouTube changes often.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
@@ -87,8 +88,97 @@ def _durable_write(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
+UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36'
+INNERTUBE_CLIENT = {'clientName': 'WEB', 'clientVersion': '2.20251120.01.00', 'hl': 'en', 'gl': 'US'}
+_conns: dict[str, http.client.HTTPSConnection] = {}
+_conn_locks: dict[str, threading.Lock] = {}
+
+
+def _https(host: str, method: str, path: str, body: bytes | None = None, headers: dict | None = None, timeout: float = 15) -> bytes:
+    """One kept-open HTTPS connection per host: through a far VPN exit each new TLS handshake costs
+    several round trips, so reusing the connection is most of the speed."""
+    lock = _conn_locks.setdefault(host, threading.Lock())
+    with lock:
+        for attempt in (1, 2):
+            conn = _conns.get(host)
+            if conn is None:
+                conn = _conns[host] = http.client.HTTPSConnection(host, timeout=timeout)
+            try:
+                conn.request(method, path, body=body, headers={'User-Agent': UA, **(headers or {})})
+                resp = conn.getresponse()
+                data = resp.read(4_000_000)
+                if resp.status >= 400:
+                    raise RuntimeError(f'{host} answered {resp.status}')
+                return data
+            except (http.client.HTTPException, OSError):
+                conn.close()
+                _conns.pop(host, None)
+                if attempt == 2:
+                    raise
+    raise RuntimeError('unreachable')
+
+
+def _walk(node: Any, key: str, out: list, limit: int = 80) -> None:
+    if len(out) >= limit:
+        return
+    if isinstance(node, dict):
+        if key in node:
+            out.append(node[key])
+        for v in node.values():
+            _walk(v, key, out, limit)
+    elif isinstance(node, list):
+        for v in node:
+            _walk(v, key, out, limit)
+
+
+def _text(obj: Any) -> str:
+    if not isinstance(obj, dict):
+        return ''
+    if 'simpleText' in obj:
+        return str(obj['simpleText'])
+    return ''.join(str(r.get('text', '')) for r in obj.get('runs', []) if isinstance(r, dict))
+
+
+def _duration_seconds(text: str) -> int | None:
+    try:
+        parts = [int(p) for p in text.split(':')]
+    except ValueError:
+        return None
+    total = 0
+    for p in parts:
+        total = total * 60 + p
+    return total
+
+
 def _thumb(video_id: str) -> str:
     return f'https://i.ytimg.com/vi/{video_id}/hqdefault.jpg'
+
+
+def search_direct(query: str, count: int) -> list[dict[str, Any]]:
+    """YouTube's own search endpoint (the same one its web page uses): about a second, versus
+    several for a yt-dlp subprocess. Only video results are kept."""
+    body = json.dumps({'context': {'client': INNERTUBE_CLIENT}, 'query': query}).encode()
+    data = json.loads(_https('www.youtube.com', 'POST', '/youtubei/v1/search?prettyPrint=false',
+                             body, {'Content-Type': 'application/json'}))
+    found: list = []
+    _walk(data, 'videoRenderer', found, limit=count * 2)
+    out = []
+    for v in found:
+        vid = v.get('videoId') or ''
+        if not VIDEO_ID.fullmatch(vid):
+            continue
+        owner = (v.get('ownerText') or v.get('longBylineText') or {}).get('runs') or [{}]
+        cid = ((owner[0].get('navigationEndpoint') or {}).get('browseEndpoint') or {}).get('browseId')
+        length = _text(v.get('lengthText'))
+        out.append({'id': vid, 'title': _text(v.get('title'))[:200],
+                    'channel': str(owner[0].get('text') or '')[:80],
+                    'channel_id': cid if CHANNEL_ID.fullmatch(str(cid or '')) else None,
+                    'duration': _duration_seconds(length) if length else None,
+                    'views': _text(v.get('viewCountText'))[:40],
+                    'thumb': _thumb(vid)})
+        if len(out) >= count:
+            break
+    return out
 
 
 def search(query: str, count: int = 24, ttl: float = 600, background: bool = False) -> list[dict[str, Any]]:
@@ -96,6 +186,12 @@ def search(query: str, count: int = 24, ttl: float = 600, background: bool = Fal
     if not query:
         return []
     def make():
+        try:   # YouTube's search endpoint first: about a second
+            direct = search_direct(query, count)
+            if direct:
+                return direct
+        except Exception:
+            pass   # fall back to yt-dlp, slower but maintained against YouTube's changes
         if background:
             with _background:
                 data = _ytdlp([f'ytsearch{count}:{query}', '--flat-playlist'])

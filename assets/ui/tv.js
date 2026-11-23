@@ -217,51 +217,5 @@
   $('chapSel').addEventListener('change', function () { if (this.value !== '') $('video').currentTime = +this.value; });
   $('video').addEventListener('pause', wake);
   $('video').addEventListener('ended', function () { remember(); wake(); });
-  // Try to add this page to the TV home screen. On VIDAA this is an undocumented browser call
-  // (Hisense_installApp); newer firmware often accepts it but adds no icon, so we report honestly
-  // and never claim success we did not see. Nothing third-party runs: this is our own page.
-  var deferredPrompt = null;
-  window.addEventListener('beforeinstallprompt', function (e) { e.preventDefault(); deferredPrompt = e; });
-  function installSays(msg) { status(msg); }
-  $('installBtn').addEventListener('click', function () {
-    var url = location.origin + '/tv';
-    var name = 'YouTube (no ads)';
-    var icon = location.origin + '/assets/ui/tv-icon.png';
-    // 1) VIDAA's own install call, under the names seen across firmware versions
-    var vidaa = window.Hisense_installApp || window.Hisense_installAp || (window.vidaa && window.vidaa.installApp);
-    if (typeof vidaa === 'function') {
-      try {
-        // signatures differ by firmware; try the common ones, stop on the first that does not throw
-        var tries = [[name, url, icon], ['sbc-youtube', name, url, icon], [url, name, icon], [url]];
-        for (var i = 0; i < tries.length; i++) { try { vidaa.apply(window, tries[i]); installSays('Asked the TV to add the icon. If it did not appear on the home screen, your firmware blocks it; keep using this as a bookmark.'); return; } catch (e) {} }
-        installSays('The TV refused every install request; keep using this as a bookmark.');
-      } catch (e) { installSays('The TV refused the install; keep using this as a bookmark.'); }
-      return;
-    }
-    // 2) the ordinary web-app install prompt (some browsers)
-    if (deferredPrompt) { deferredPrompt.prompt(); installSays('Confirm the install in the prompt.'); deferredPrompt = null; return; }
-    // 3) nothing available
-    installSays('This TV has no app-install function in its browser. Add /tv as a bookmark or favourite instead, and open it full screen.');
-  });
-
-
-  // ---- what this TV's browser can do: sent once to the board so install and developer-mode
-  // questions are answered by measurement. Function names, screen and codec support only.
-  function report() {
-    try {
-      var names = [];
-      for (var k in window) { if (/hisense|vidaa|omi|oipf|hbbtv|tizen|webos|netcast|jsbridge|native|devmode|debug|install/i.test(k)) names.push(k + ':' + typeof window[k]); }
-      Object.getOwnPropertyNames(window).forEach(function (k) { if (/hisense|vidaa|omi|oipf|hbbtv|install|debug/i.test(k) && names.indexOf(k + ':' + typeof window[k]) < 0) names.push(k + ':' + typeof window[k]); });
-      var ms = window.MediaSource || window.WebKitMediaSource;
-      var codecs = {};
-      ['video/mp4; codecs="avc1.64001F"', 'video/mp4; codecs="avc1.640028"', 'video/webm; codecs="vp9"', 'video/mp4; codecs="av01.0.08M.08"', 'audio/mp4; codecs="mp4a.40.2"', 'audio/webm; codecs="opus"']
-        .forEach(function (c) { codecs[c] = !!(ms && ms.isTypeSupported && ms.isTypeSupported(c)); });
-      var body = {ua: navigator.userAgent.slice(0, 300), w: window.innerWidth, h: window.innerHeight, dpr: window.devicePixelRatio,
-                  sw: screen.width, sh: screen.height, names: names.slice(0, 200), mse: !!ms, hlsNative: !!document.createElement('video').canPlayType('application/vnd.apple.mpegurl'),
-                  hlsjs: !!(window.Hls && window.Hls.isSupported()), sw_api: 'serviceWorker' in navigator, codecs: codecs};
-      fetch('/api/tv/diag', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)}).catch(function () {});
-    } catch (e) { /* never block the page */ }
-  }
-  report();
   api('account').then(function (d) { account = !!d.connected; $('recBtn').hidden = !account; }).catch(function () {}).then(loadHome);
 })();
