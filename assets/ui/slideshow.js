@@ -55,6 +55,11 @@
     options = options || {};
     this.host = host;
     this.interval = Math.max(5000, options.interval || 300000);
+    // 'wallpapers' (the dashboard's) or 'moodboard' (the Pinterest board, for the living room)
+    this.collection = /^(wallpapers|moodboard)$/.test(options.collection || '') ? options.collection : 'wallpapers';
+    // 'cover' fills the screen; 'contain-blur' shows the whole picture over a blurred copy of itself
+    this.fit = options.fit === 'contain-blur' ? 'contain-blur' : 'cover';
+    this.fallback = options.fallback !== false;
     this.list = [];
     this.order = [];
     this.slot = -1;
@@ -64,20 +69,26 @@
     this.layers = [document.createElement('div'), document.createElement('div')];
     this.front = 0;
     for (var i = 0; i < 2; i++) {
-      this.layers[i].className = 'sbc-slide';
+      this.layers[i].className = 'sbc-slide' + (this.fit === 'contain-blur' ? ' contain' : '');
+      if (this.fit === 'contain-blur') {
+        var blur = document.createElement('div'); blur.className = 'sbc-blur';
+        var fg = document.createElement('div'); fg.className = 'sbc-fg';
+        this.layers[i].appendChild(blur); this.layers[i].appendChild(fg);
+      }
       host.appendChild(this.layers[i]);
     }
   }
 
   SbcSlideshow.prototype.load = function () {
     var self = this;
-    return fetch('/assets/wallpapers/index.json', {credentials: 'same-origin', cache: 'no-cache'})
+    return fetch('/assets/' + self.collection + '/index.json', {credentials: 'same-origin', cache: 'no-cache'})
       .then(function (r) { return r.ok ? r.json() : {images: []}; })
       .catch(function () { return {images: []}; })
       .then(function (data) {
         var images = (data && Array.isArray(data.images)) ? data.images : [];
         self.list = images.filter(function (n) { return /^[A-Za-z0-9][A-Za-z0-9_.-]{0,120}\.(jpe?g|webp|png)$/.test(n); })
-          .map(function (n) { return '/assets/wallpapers/' + n; });
+          .map(function (n) { return '/assets/' + self.collection + '/' + n; });
+        if (!self.list.length && !self.fallback) return 0;
         if (!self.list.length) self.list = FALLBACK.slice();
         self.order = seededShuffle(self.list);
         return self.list.length;
@@ -87,7 +98,9 @@
   SbcSlideshow.prototype.show = function (url) {
     var back = this.layers[1 - this.front];
     var front = this.layers[this.front];
-    back.style.backgroundImage = 'url("' + url.replace(/"/g, '%22') + '")';
+    var css = 'url("' + url.replace(/"/g, '%22') + '")';
+    if (this.fit === 'contain-blur') { back.firstChild.style.backgroundImage = css; back.lastChild.style.backgroundImage = css; }
+    else back.style.backgroundImage = css;
     back.classList.add('on');
     front.classList.remove('on');
     this.front = 1 - this.front;

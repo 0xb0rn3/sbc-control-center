@@ -107,10 +107,14 @@ def tube_request(path: str, body: bytes | None = None) -> tuple[int, bytes]:
 WALLPAPER_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,120}\.(?:jpe?g|webp|png)')
 
 
-def wallpaper_index() -> bytes:
-    """The slideshow's picture list, read from the wallpaper folder as it is now."""
+MOODBOARD_DIR = sbc_site.STATE_DIR / 'moodboard'
+MOODBOARD_NAME = re.compile(r'mb-[0-9a-f]{16}\.(?:jpg|png|webp)')
+
+
+def wallpaper_index(folder: Path | None = None) -> bytes:
+    """The slideshow's picture list, read from the wallpaper (or mood board) folder as it is now."""
     try:
-        names = sorted(entry.name for entry in os.scandir(ASSETS_DIR / 'wallpapers')
+        names = sorted(entry.name for entry in os.scandir(folder or ASSETS_DIR / 'wallpapers')
                        if entry.is_file(follow_symlinks=False) and WALLPAPER_NAME.fullmatch(entry.name))
     except OSError:
         names = []
@@ -1074,6 +1078,29 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if path.startswith('/assets/moodboard/'):
+            name = path[len('/assets/moodboard/'):]
+            if name == 'index.json':
+                body, kind = wallpaper_index(MOODBOARD_DIR), 'application/json'
+            elif MOODBOARD_NAME.fullmatch(name):
+                try:
+                    fd = os.open(MOODBOARD_DIR / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                    with os.fdopen(fd, 'rb') as handle:
+                        body = handle.read(STATIC_MAX_BYTES * 2)
+                except OSError:
+                    self.send_error(404, 'Picture not found')
+                    return
+                kind = STATIC_TYPES['.' + name.rsplit('.', 1)[1]]
+            else:
+                self.send_error(404, 'Picture not found')
+                return
+            self.send_response(200)
+            self.send_header('Content-Type', kind)
+            self.send_header('Content-Length', str(len(body)))
+            self.security_headers(cache='public, max-age=300' if name == 'index.json' else 'public, max-age=86400')
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if path == '/assets/wallpapers/index.json':
             body = wallpaper_index()
             self.send_response(200)
@@ -1755,6 +1782,8 @@ class Handler(BaseHTTPRequestHandler):
                 payload = {'action': 'device_scan', 'interfaces': data.get('interfaces')}
             elif action == 'device_fingerprint':
                 payload = {'action': 'device_fingerprint', 'ip': data.get('ip')}
+            elif action == 'moodboard_refresh':
+                payload = {'action': action}
             elif action in {'vpn_refresh', 'vpn_latency', 'vpn_switch', 'vpn_random', 'vpn_rotation', 'devroute_set', 'vpn_second'}:
                 payload = {'action': action}
                 for key in ('country', 'hostname', 'countries', 'enabled', 'hours', 'mac', 'route', 'label'):

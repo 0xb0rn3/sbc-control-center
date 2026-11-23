@@ -80,6 +80,7 @@ USER_AGENT = 'SBCControlCenter'
 DEFAULTS: dict[str, str] = {
     'device_label': 'SBC Control Center',
     'home_location': '',            # "lat,lon" for the threat map (empty: the time zone's city)
+    'moodboard_feed': '',           # a public Pinterest board's RSS feed for the living room
     'greeting_name': '',            # living-room greeting: "Good evening, <name>" (empty: no name)
     'uplink_interface': 'end0',
     'ap_interface': 'wlan1',
@@ -119,6 +120,8 @@ def _valid(key: str, value: str) -> bool:
             return False
     if key.endswith('_ssid'):
         return 0 < len(value.encode('utf-8')) <= 32 and '\n' not in value
+    if key.endswith('_feed'):
+        return bool(re.fullmatch(r'https://[A-Za-z0-9.-]{3,80}/[A-Za-z0-9_./-]{1,160}', value))
     if key == 'dhcp_lease_file':
         return value.startswith('/') and '..' not in value and len(value) < 200
     return bool(_LABEL.fullmatch(value))
@@ -149,4 +152,4 @@ def ap_subnets(cfg: dict[str, str]) -> list[str]:
 
 def public_view(cfg: dict[str, str]) -> dict[str, str]:
     """What the signed-in browser may see: everything here is already visible on the device."""
-    return {k: cfg[k] for k in DEFAULTS if k != 'dhcp_lease_file'}
+    return {k: cfg[k] for k in DEFAULTS if k not in ('dhcp_lease_file', 'moodboard_feed')}

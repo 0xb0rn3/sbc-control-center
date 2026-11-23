@@ -48,6 +48,7 @@ import vpn_library
 import packet_history
 import threat_map
 import devroute
+import moodboard
 
 BASE = sbc_site.ETC_DIR
 STATE = sbc_site.STATE_DIR
@@ -1395,6 +1396,18 @@ def vpn_action(action: str, req: dict[str, Any]) -> dict[str, Any]:
     return {'ok': False, 'error': 'Unknown VPN action.'}
 
 
+def moodboard_scheduler() -> None:
+    time.sleep(90)
+    while True:
+        try:
+            if moodboard.feed_url():
+                result = moodboard.refresh()
+                print(f"[MOODBOARD] {result.get('message') or result.get('error')}", flush=True)
+        except Exception as exc:
+            print(f'[MOODBOARD] refresh failed: {exc}', flush=True)
+        time.sleep(6 * 3600)
+
+
 def vpn_rotation_scheduler() -> None:
     time.sleep(30)
     while True:
@@ -1422,6 +1435,8 @@ def do_action(req: dict[str, Any], trusted_root_peer: bool = False) -> dict[str,
     if action == 'telemetry':
         with telemetry_lock:
             return {'ok': True, 'telemetry': telemetry.snapshot()}
+    if action == 'moodboard_refresh':
+        return moodboard.refresh()
     if action == 'devroute_status':
         return devroute.status()
     if action == 'devroute_set':
@@ -1702,6 +1717,7 @@ def main() -> None:
     threading.Thread(target=terminal_reaper, daemon=True, name='terminal-reaper').start()
     threading.Thread(target=vpn_rotation_scheduler, daemon=True, name='vpn-rotation').start()
     threading.Thread(target=threat_map.refresher, daemon=True, name='threat-feeds').start()
+    threading.Thread(target=moodboard_scheduler, daemon=True, name='moodboard').start()
     SOCKET_DIR.mkdir(mode=0o750, parents=True, exist_ok=True)
     try:
         SOCKET_PATH.unlink()

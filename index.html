@@ -454,6 +454,7 @@ pre { max-height: 430px; margin: 0; padding: 12px; overflow: auto; border: 1px s
 </head>
 <body>
 <div id="sbcBackdrop" class="sbc-backdrop" aria-hidden="true"></div>
+<div id="lrPictures" class="lr-pictures" hidden aria-hidden="true"></div>
 <div id="standbyOverlay" hidden></div>
 <div id="standbyHint" class="standby-hint" hidden>Press any key or tap to return to the dashboard</div>
 <div class="shell">
@@ -857,6 +858,7 @@ Type help to list the available commands. DNS commands: dns status, dns profiles
             <div class="field"><label for="standbyIdle">Open the living room when idle</label><select id="standbyIdle" class="select"><option value="0">Never</option><option value="5">After 5 minutes</option><option value="10">After 10 minutes</option><option value="15">After 15 minutes</option><option value="30">After 30 minutes</option></select></div>
           </div>
           <p class="footnote" id="wallpaperCount">Loading wallpapers…</p>
+          <p class="footnote"><span id="moodboardCount">Checking the mood board…</span> <button class="btn small" id="moodboardRefresh" type="button">Refresh mood board</button></p>
           <p class="footnote">For the TV, open <code>/living-room</code> on this server and leave it there: it needs no sign-in and shows only the wallpapers, the time and quotes. <code>?interval=60</code> sets the seconds between pictures.</p>
         </div>
         <div class="card" style="margin-top:12px" id="passkeyPanel">
@@ -1681,12 +1683,14 @@ function applyDisplaySettings(){
   slideshow.setInterval(d.bgInterval*1000);
   if(d.bg==='on')slideshow.start();else slideshow.stop();
 }
-let livingRoom=null;
+let livingRoom=null,lrPictures=null,lrPicturesCount=0;
 function pausePollingForStandby(){clearInterval(refreshTimer);clearInterval(jobTimer);clearInterval(portalUpdateTimer);clearInterval(deviceDiscoveryTimer);clearInterval(securityOperationsTimer);clearTimeout(telemetryTimer);}
 function enterStandby(fromUser=false){
   if(standbyActive)return;standbyActive=true;
   document.body.classList.add('standby');$('standbyOverlay').hidden=false;$('standbyHint').hidden=false;
   clearTimeout(standbyHintTimer);standbyHintTimer=setTimeout(()=>{$('standbyHint').hidden=true;},4000);
+  // the living room shows the mood board (when it has pictures) over the dashboard's wallpapers
+  if(lrPictures&&lrPicturesCount>0){$('lrPictures').hidden=false;lrPictures.setInterval(displaySettings().standbyInterval*1000);lrPictures.start();}
   if(window.SbcLivingRoom&&!livingRoom)livingRoom=SbcLivingRoom.mount($('standbyOverlay'),{name:SITE.greeting_name,label:SITE.device_label});
   pausePollingForStandby();
   applyDisplaySettings();
@@ -1696,6 +1700,7 @@ function exitStandby(){
   if(!standbyActive)return;standbyActive=false;
   document.body.classList.remove('standby');$('standbyOverlay').hidden=true;$('standbyHint').hidden=true;
   if(livingRoom){livingRoom.stop();livingRoom=null;}
+  if(lrPictures){lrPictures.stop();$('lrPictures').hidden=true;}
   if(document.fullscreenElement&&document.exitFullscreen)document.exitFullscreen().catch(()=>{});
   applyDisplaySettings();
   if(!$('appView').classList.contains('hidden')){startPolling();refreshAll();}
@@ -1717,10 +1722,13 @@ function initDisplayControls(){
   $('standbyBtn').addEventListener('click',start);$('standbyStartBtn').addEventListener('click',start);
 }
 if(window.SbcSlideshow){
+  lrPictures=new SbcSlideshow($('lrPictures'),{interval:displaySettings().standbyInterval*1000,collection:'moodboard',fit:'contain-blur',fallback:false});
+  lrPictures.load().then(n=>{lrPicturesCount=n;const m=$('moodboardCount');if(m)m.textContent=n?`${n} mood board picture(s) for the living room.`:'No mood board yet: the living room shows the wallpapers.';});
   slideshow=new SbcSlideshow($('sbcBackdrop'),{interval:displaySettings().bgInterval*1000});
   slideshow.load().then(count=>{$('wallpaperCount').textContent=count>1?`${count} wallpapers in the slideshow.`:'No wallpapers on this server yet: the built-in background is shown.';applyDisplaySettings();if(displaySettings().bg!=='on')slideshow.sync(true);});
 }
 initDisplayControls();
+$('moodboardRefresh').addEventListener('click',async event=>{const b=event.currentTarget;b.disabled=true;try{const r=await api('/api/action',{method:'POST',body:JSON.stringify({action:'moodboard_refresh'})});if(r.ok===false)throw new Error(r.error);showToast(r.message);if(lrPictures){lrPicturesCount=await lrPictures.load();$('moodboardCount').textContent=`${lrPicturesCount} mood board picture(s) for the living room.`;}}catch(e){showToast(e.message,true);}finally{b.disabled=false;}});
 
 // ---- 24-hour packet history
 function historyAgo(ts){return ts?vpnAgo(ts):'—';}
