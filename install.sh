@@ -280,6 +280,8 @@ python3 "$APP_DIR/set_password.py"
 printf '\n[7/7] Starting Control Center...\n'
 systemctl daemon-reload
 systemctl enable --now sbc-control-center-agent.service sbc-control-center-web.service
+# monthly IEEE vendor registry refresh (the unit is written by the program it runs)
+python3 "$APP_DIR/sbc_admin.py" oui install-units
 
 AP_ADDR="$AP_IP"
 ETH_ADDR="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}' || true)"

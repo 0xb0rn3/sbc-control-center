@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import socket
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -24,6 +25,68 @@ AP_IFACES = tuple(sbc_site.ap_interfaces(_SITE))
 CAPTURE_IFACES = (*AP_IFACES, _SITE['vpn_interface'], _SITE['uplink_interface'])
 DEFAULT_CAPTURE_INTERFACES = ','.join(CAPTURE_IFACES)
 PROG = f'{sbc_site.PREFIX}-admin'
+IEEE_UNIT = f'{sbc_site.PREFIX}-ieee-update'
+SYSTEMD_DIR = Path('/etc/systemd/system')
+
+
+def ieee_units() -> dict[str, str]:
+    """The monthly IEEE registry refresh. ExecStart is this program's own path, so a rename
+    of the program can never leave the timer pointing at a file that is gone."""
+    admin = Path(os.path.abspath(__file__))
+    service = f"""[Unit]
+Description=Refresh local IEEE MAC address-block registry
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory={admin.parent}
+ExecStart=/usr/bin/python3 {admin} oui update
+TimeoutStartSec=180
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths={device_intelligence.OUI_DATA_DIR}
+"""
+    timer = f"""[Unit]
+Description=Monthly refresh of the local IEEE MAC address-block registry
+
+[Timer]
+OnBootSec=12h
+OnUnitActiveSec=30d
+AccuracySec=1h
+RandomizedDelaySec=6h
+Unit={IEEE_UNIT}.service
+
+[Install]
+WantedBy=timers.target
+"""
+    return {f'{IEEE_UNIT}.service': service, f'{IEEE_UNIT}.timer': timer}
+
+
+def install_ieee_units() -> int:
+    # the sandboxed unit can only write here, so the folder must exist before the first run
+    device_intelligence.OUI_DATA_DIR.mkdir(parents=True, exist_ok=True, mode=0o750)
+    for name, text in ieee_units().items():
+        path = SYSTEMD_DIR / name
+        tmp = path.with_name('.' + name + '.new')
+        with open(tmp, 'w', encoding='utf-8') as handle:   # fsync + rename: a power cut never leaves an empty unit
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    subprocess.run(['systemctl', 'daemon-reload'], check=True)
+    subprocess.run(['systemctl', 'enable', '--now', f'{IEEE_UNIT}.timer'], check=True)
+    subprocess.run(['systemctl', 'reset-failed', f'{IEEE_UNIT}.service'], check=False, capture_output=True)
+    print(f'{IEEE_UNIT}.timer enabled: runs {Path(os.path.abspath(__file__))} oui update every 30 days')
+    return 0
 
 
 def _agent_request(payload: dict[str, Any], timeout: float = 20.0) -> dict[str, Any]:
@@ -166,6 +229,7 @@ def main(argv: list[str] | None = None) -> int:
     oui = sub.add_parser('oui', help='Local IEEE MAC vendor registry')
     oui_sub = oui.add_subparsers(dest='oui_command', required=True)
     oui_sub.add_parser('update', help='Download official IEEE MA-L/MA-M/MA-S registries (no client MAC upload)')
+    oui_sub.add_parser('install-units', help='Install the monthly registry refresh timer (points at this program)')
 
     devices = sub.add_parser('devices', help='Device discovery and manual identity labels')
     devices_sub = devices.add_subparsers(dest='devices_command', required=True)
@@ -242,8 +306,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == 'oui':
         if os.geteuid() != 0:
-            print(f'Run this command with sudo: sudo {PROG} oui update', file=sys.stderr)
+            print(f'Run this command with sudo: sudo {PROG} oui {args.oui_command}', file=sys.stderr)
             return 2
+        if args.oui_command == 'install-units':
+            return install_ieee_units()
         result = device_intelligence.update_vendor_database()
         print(result.get('message') or json.dumps(result, indent=2))
         for registry, count in (result.get('registries') or {}).items():
