@@ -27,8 +27,16 @@
     var first = $('grid').querySelector('[data-nav]');
     if (first && document.activeElement === document.body) first.focus();
   }
+  var account = false;
   function loadHome() {
     status('Loading…');
+    if (account) {   // signed in: your own YouTube subscriptions feed
+      Promise.all([api('feed?name=subs'), api('history')]).then(function (r) {
+        var resume = (r[1].items || []).filter(function (v) { return v.position && v.duration && v.position < v.duration - 30; }).slice(0, 8);
+        show(resume.length ? 'Continue watching · Your subscriptions' : 'Your subscriptions', resume.concat(r[0].items || []));
+      }).catch(function (e) { status(e.message); });
+      return;
+    }
     Promise.all([api('home'), api('history')]).then(function (r) {
       subs = r[0].subscriptions || [];
       var resume = (r[1].items || []).filter(function (v) { return v.position && v.duration && v.position < v.duration - 30; }).slice(0, 8);
@@ -169,7 +177,8 @@
   $('searchForm').addEventListener('submit', function (e) { e.preventDefault(); search($('q').value); });
   $('homeBtn').addEventListener('click', loadHome);
   $('historyBtn').addEventListener('click', function () { api('history').then(function (d) { show('History', d.items); }); });
-  $('laterBtn').addEventListener('click', function () { api('later').then(function (d) { show('Watch Later', d.items); }); });
+  $('laterBtn').addEventListener('click', function () { api(account ? 'feed?name=later' : 'later').then(function (d) { show('Watch Later', d.items); }).catch(function (e) { status(e.message); }); });
+  $('recBtn').addEventListener('click', function () { status('Loading recommendations…'); api('feed?name=rec').then(function (d) { show('Recommended', d.items); }).catch(function (e) { status(e.message); }); });
   $('closeBtn').addEventListener('click', closePlayer);
   $('subBtn').addEventListener('click', function () {
     if (!current || !current.channel_id) return;
@@ -184,5 +193,5 @@
   $('chapSel').addEventListener('change', function () { if (this.value !== '') $('video').currentTime = +this.value; });
   $('video').addEventListener('pause', wake);
   $('video').addEventListener('ended', function () { remember(); wake(); });
-  loadHome();
+  api('account').then(function (d) { account = !!d.connected; $('recBtn').hidden = !account; }).catch(function () {}).then(loadHome);
 })();

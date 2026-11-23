@@ -1125,7 +1125,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        if path.startswith('/api/tv/') and path[8:] in ('search', 'video', 'channel', 'home', 'history', 'later', 'captions'):
+        if path.startswith('/api/tv/') and path[8:] in ('search', 'video', 'channel', 'home', 'history', 'later', 'captions', 'account', 'feed'):
             if not tube_allowed(client_ip(self)):
                 self.send_json(429, {'ok': False, 'error': 'Too many requests; wait a minute.'})
                 return
@@ -1394,6 +1394,27 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == '/api/vpn/import':
             self.handle_vpn_import()
+            return
+        if path == '/api/tv/cookies':
+            # the YouTube account: only a signed-in administrator may connect or disconnect it
+            auth = self.require_session()
+            if not auth:
+                return
+            if not self.verify_csrf(auth[1]):
+                self.send_json(403, {'ok': False, 'error': 'CSRF validation failed.'})
+                return
+            try:
+                data = self.read_json(max_body=512 * 1024)
+            except Exception as exc:
+                self.send_json(400, {'ok': False, 'error': str(exc)})
+                return
+            status, body = tube_request('/cookies', json.dumps({'text': str(data.get('text', ''))[:400_000], 'clear': bool(data.get('clear'))}).encode())
+            self.send_response(status)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.security_headers()
+            self.end_headers()
+            self.wfile.write(body)
             return
         if path in ('/api/tv/subscribe', '/api/tv/history', '/api/tv/later', '/api/tv/takeout'):
             if not tube_allowed(client_ip(self)):

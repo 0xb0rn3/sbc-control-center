@@ -42,6 +42,9 @@ _cache: dict[str, tuple[float, Any]] = {}
 _lock = threading.Lock()
 _slots = threading.BoundedSemaphore(3)   # at most three extractions at once on a small board
 _caption_urls: dict[str, dict[tuple[str, bool], str]] = {}
+COOKIES = STATE / 'cookies.txt'
+ACCOUNT_FEEDS = {'subs': ':ytsubs', 'rec': ':ytrec', 'later': ':ytwatchlater', 'history': ':ythistory'}
+COOKIE_DOMAINS = ('.youtube.com', 'youtube.com', '.google.com', 'accounts.google.com', '.googleapis.com')
 LIST_LIMIT = 300
 
 
@@ -63,7 +66,8 @@ def _ytdlp(args: list[str], timeout: float = 40) -> dict[str, Any]:
     if not _slots.acquire(timeout=20):
         raise RuntimeError('busy: try again in a moment')
     try:
-        cp = subprocess.run([str(YTDLP), '--no-cache-dir', '--no-warnings', '--js-runtimes', f'deno:{DENO}', '-J', *args],
+        account = ['--cookies', str(COOKIES)] if COOKIES.exists() else []
+        cp = subprocess.run([str(YTDLP), '--no-cache-dir', '--no-warnings', '--js-runtimes', f'deno:{DENO}', *account, '-J', *args],
                             capture_output=True, text=True, timeout=timeout, env={'HOME': str(STATE), 'PATH': '/usr/bin:/bin'})
     finally:
         _slots.release()
@@ -209,6 +213,46 @@ def import_takeout(csv_text: str) -> list[dict[str, str]]:
     return subscriptions()
 
 
+def set_cookies(text: str) -> dict[str, Any]:
+    """A Netscape cookies.txt exported from a private window: only YouTube and Google cookies are kept."""
+    kept = []
+    for line in str(text).splitlines()[:5000]:
+        fields = line.split('\t')
+        if len(fields) == 7 and fields[0].removeprefix('#HttpOnly_').endswith(COOKIE_DOMAINS):
+            kept.append(line)
+    if not any('youtube.com' in l for l in kept) or not any(l.split('\t')[5] in ('SAPISID', '__Secure-3PAPISID', 'LOGIN_INFO') for l in kept):
+        raise ValueError('These are not signed-in YouTube cookies (export them from youtube.com while signed in).')
+    STATE.mkdir(parents=True, exist_ok=True)
+    _durable_write(COOKIES, '# Netscape HTTP Cookie File\n' + '\n'.join(kept) + '\n')
+    os.chmod(COOKIES, 0o600)
+    _cache.clear()
+    return {'connected': True, 'cookies': len(kept)}
+
+
+def clear_cookies() -> dict[str, Any]:
+    COOKIES.unlink(missing_ok=True)
+    _cache.clear()
+    return {'connected': False}
+
+
+def account_feed(name: str, count: int = 40) -> list[dict[str, Any]]:
+    if name not in ACCOUNT_FEEDS:
+        raise ValueError('unknown feed')
+    if not COOKIES.exists():
+        raise ValueError('No YouTube account is connected.')
+    def make():
+        data = _ytdlp([ACCOUNT_FEEDS[name], '--flat-playlist', '-I', f'1:{count}'], timeout=90)
+        out = []
+        for e in data.get('entries') or []:
+            vid = e.get('id') or ''
+            if VIDEO_ID.fullmatch(vid):
+                out.append({'id': vid, 'title': str(e.get('title') or '')[:200], 'channel': str(e.get('channel') or e.get('uploader') or '')[:80],
+                            'channel_id': e.get('channel_id') if CHANNEL_ID.fullmatch(str(e.get('channel_id') or '')) else None,
+                            'duration': e.get('duration'), 'thumb': _thumb(vid)})
+        return out
+    return _cached(f'a:{name}', 900, make)
+
+
 def subscriptions() -> list[dict[str, str]]:
     try:
         data = json.loads((STATE / 'channels.json').read_text())
@@ -268,6 +312,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, {'ok': True, 'items': home(), 'subscriptions': subscriptions()})
             elif url.path in ('/history', '/later'):
                 self.reply(200, {'ok': True, 'items': get_list(url.path[1:])})
+            elif url.path == '/account':
+                self.reply(200, {'ok': True, 'connected': COOKIES.exists()})
+            elif url.path == '/feed':
+                self.reply(200, {'ok': True, 'items': account_feed(q.get('name', ''))})
             elif url.path == '/captions':
                 body = captions(q.get('id', ''), q.get('lang', ''), q.get('auto') == '1').encode()
                 self.send_response(200)
@@ -289,6 +337,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, {'ok': True, 'subscriptions': subscribe(data.get('id', ''), data.get('name', ''), bool(data.get('add', True)))})
             elif url.path in ('/history', '/later'):
                 self.reply(200, {'ok': True, 'items': put_item(url.path[1:], data.get('item') or {}, bool(data.get('remove')))})
+            elif url.path == '/cookies':
+                self.reply(200, {'ok': True, **(clear_cookies() if data.get('clear') else set_cookies(data.get('text', '')))})
             elif url.path == '/takeout':
                 self.reply(200, {'ok': True, 'subscriptions': import_takeout(str(data.get('csv', ''))[:200_000])})
             else:
