@@ -97,6 +97,71 @@ class TubeTests(unittest.TestCase):
             self.assertEqual(tube.captions('jNQXAC9IVRw', 'en', False), 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nhi\n')
             self.assertTrue(tube.captions('jNQXAC9IVRw', 'de', False).startswith('WEBVTT\n\n00:00:01.000'))
 
+    def test_cached_makes_a_value_once_for_concurrent_requests(self):
+        made = []
+        def make():
+            made.append(1); time.sleep(0.2); return 'v'
+        results = []
+        threads = [threading.Thread(target=lambda: results.append(tube._cached('k:x', 60, make))) for _ in range(3)]
+        [t.start() for t in threads]; [t.join() for t in threads]
+        self.assertEqual((len(made), results), (1, ['v', 'v', 'v']))
+
+    def test_warm_looks_up_once_in_the_background_at_low_priority(self):
+        calls = []
+        def fake_ytdlp(args, timeout=40, nice=0):
+            calls.append(nice); time.sleep(0.3)
+            return {'title': 't', 'formats': [{'protocol': 'm3u8_native', 'url': 'https://x/v.m3u8', 'manifest_url': 'https://x/m.m3u8'}]}
+        with mock.patch.object(tube, '_ytdlp', side_effect=fake_ytdlp):
+            self.assertEqual(tube.warm('jNQXAC9IVRw'), 'started')
+            for _ in range(50):
+                if 'v:jNQXAC9IVRw' in tube._making: break
+                time.sleep(0.01)
+            self.assertEqual(tube.warm('jNQXAC9IVRw'), 'busy')
+            self.assertEqual(tube.video('jNQXAC9IVRw')['hls'], 'https://x/m.m3u8')   # OK pressed meanwhile: waits, no second lookup
+            for _ in range(100):
+                if not tube._warm_busy: break
+                time.sleep(0.01)
+            self.assertEqual(tube.warm('jNQXAC9IVRw'), 'ready')
+        self.assertEqual(calls, [10])
+        with self.assertRaises(ValueError):
+            tube.warm('../x')
+
+    def test_related_reads_watch_next_videos_only(self):
+        def lockup(vid, kind='LOCKUP_CONTENT_TYPE_VIDEO', title='A title', badge='12:34', channel='Chan'):
+            return {'lockupViewModel': {'contentId': vid, 'contentType': kind,
+                    'contentImage': {'thumbnailViewModel': {'overlays': [{'thumbnailOverlayBadgeViewModel': {'thumbnailBadges': [{'thumbnailBadgeViewModel': {'text': badge}}]}}]}},
+                    'metadata': {'lockupMetadataViewModel': {'title': {'content': title}, 'metadata': {'contentMetadataViewModel': {
+                        'metadataRows': [{'metadataParts': [{'text': {'content': channel}}]}, {'metadataParts': [{'text': {'content': '1M'}}]}]}}}}}}
+        page = {'contents': {'twoColumnWatchNextResults': {'secondaryResults': {'secondaryResults': {'results': [
+            lockup('aaaaaaaaaaa'), lockup('bbbbbbbbbbb', badge='LIVE'), lockup('RDaaaaaaaaaaa', kind='LOCKUP_CONTENT_TYPE_PLAYLIST'),
+            lockup('jNQXAC9IVRw'), lockup('bad id'), lockup('aaaaaaaaaaa'), lockup('ccccccccccc', title='')]}}}}}
+        with mock.patch.object(tube, '_https', return_value=json.dumps(page).encode()) as call:
+            items = tube.related('jNQXAC9IVRw')
+            tube.related('jNQXAC9IVRw')
+        self.assertEqual(call.call_count, 1)   # cached
+        self.assertEqual([i['id'] for i in items], ['aaaaaaaaaaa', 'bbbbbbbbbbb'])
+        self.assertEqual((items[0]['duration'], items[0]['channel'], items[0]['live']), (754, 'Chan', False))
+        self.assertTrue(items[1]['live'])
+        with self.assertRaises(ValueError):
+            tube.related('nope')
+
+    def test_playlist_reads_a_mix_as_a_queue(self):
+        def entry(vid, title, by, length):
+            return {'playlistPanelVideoRenderer': {'videoId': vid, 'title': {'simpleText': title},
+                    'shortBylineText': {'runs': [{'text': by}]}, 'lengthText': {'simpleText': length}}}
+        page = {'contents': {'twoColumnWatchNextResults': {'playlist': {'playlist': {'title': 'Mix - Zoo', 'contents': [
+            entry('jNQXAC9IVRw', 'Me at the zoo', 'jawed', '0:19'), entry('aaaaaaaaaaa', 'Next one', 'Chan', '1:02:03'),
+            entry('jNQXAC9IVRw', 'dup', 'x', '0:01'), entry('bad', 'x', 'x', '0:01'), {'automixPreviewVideoRenderer': {}}]}}}}}
+        with mock.patch.object(tube, '_https', return_value=json.dumps(page).encode()) as call:
+            q = tube.playlist('RDjNQXAC9IVRw')
+        sent = json.loads(call.call_args[0][3])
+        self.assertEqual((sent['playlistId'], sent['videoId']), ('RDjNQXAC9IVRw', 'jNQXAC9IVRw'))   # a mix starts from its video
+        self.assertEqual(q['title'], 'Mix - Zoo')
+        self.assertEqual([(i['id'], i['duration'], i['channel']) for i in q['items']], [('jNQXAC9IVRw', 19, 'jawed'), ('aaaaaaaaaaa', 3723, 'Chan')])
+        for bad in (('nope', ''), ('PL' + 'x' * 70, ''), ('RDjNQXAC9IVRw', '../x')):
+            with self.assertRaises(ValueError):
+                tube.playlist(*bad)
+
 
 MASTER = """#EXTM3U
 #EXT-X-INDEPENDENT-SEGMENTS

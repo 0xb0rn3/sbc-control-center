@@ -45,6 +45,7 @@ VIDEO_ID = re.compile(r'[A-Za-z0-9_-]{11}')
 CHANNEL_ID = re.compile(r'UC[A-Za-z0-9_-]{22}')
 _cache: dict[str, tuple[float, Any]] = {}
 _lock = threading.Lock()
+_making: dict[str, threading.Event] = {}
 _slots = threading.BoundedSemaphore(3)   # at most three extractions at once on a small board
 _background = threading.BoundedSemaphore(2)   # home-page topic rows use two of them at most: one stays free for you
 _caption_urls: dict[str, dict[tuple[str, bool], str]] = {}
@@ -55,11 +56,24 @@ LIST_LIMIT = 300
 
 
 def _cached(key: str, ttl: float, make):
-    with _lock:
-        hit = _cache.get(key)
-        if hit and time.time() - hit[0] < ttl:
-            return hit[1]
-    value = make()
+    """A value from the cache, made once: a second request for a key that is being made (a lookup
+    started in the background, then OK pressed on the same video) waits for that result."""
+    while True:
+        with _lock:
+            hit = _cache.get(key)
+            if hit and time.time() - hit[0] < ttl:
+                return hit[1]
+            making = _making.get(key)
+            if making is None:
+                making = _making[key] = threading.Event()
+                break
+        making.wait(90)   # then look again: if that attempt failed, this request makes it itself
+    try:
+        value = make()
+    finally:
+        with _lock:
+            _making.pop(key, None)
+        making.set()
     with _lock:
         _cache[key] = (time.time(), value)
         if len(_cache) > 500:
@@ -68,13 +82,14 @@ def _cached(key: str, ttl: float, make):
     return value
 
 
-def _ytdlp(args: list[str], timeout: float = 40) -> dict[str, Any]:
+def _ytdlp(args: list[str], timeout: float = 40, nice: int = 0) -> dict[str, Any]:
     if not _slots.acquire(timeout=20):
         raise RuntimeError('busy: try again in a moment')
     try:
         account = ['--cookies', str(COOKIES)] if COOKIES.exists() else []
         cp = subprocess.run([str(YTDLP), '--no-cache-dir', '--no-warnings', '--js-runtimes', f'deno:{DENO}', *account, '-J', *args],
-                            capture_output=True, text=True, timeout=timeout, env={'HOME': str(STATE), 'PATH': '/usr/bin:/bin'})
+                            capture_output=True, text=True, timeout=timeout, env={'HOME': str(STATE), 'PATH': '/usr/bin:/bin'},
+                            preexec_fn=(lambda: os.nice(nice)) if nice else None)
     finally:
         _slots.release()
     if cp.returncode != 0:
@@ -212,11 +227,15 @@ def search(query: str, count: int = 24, ttl: float = 600, background: bool = Fal
     return _cached(f's:{query}:{count}', ttl, make)
 
 
-def video(video_id: str) -> dict[str, Any]:
+def video(video_id: str, background: bool = False) -> dict[str, Any]:
     if not VIDEO_ID.fullmatch(video_id or ''):
         raise ValueError('not a video id')
     def make():
-        d = _ytdlp([f'https://www.youtube.com/watch?v={video_id}'])
+        if background:   # a lookup ahead of time: one slot always stays free for the video you open
+            with _background:
+                d = _ytdlp([f'https://www.youtube.com/watch?v={video_id}'], nice=10)
+        else:
+            d = _ytdlp([f'https://www.youtube.com/watch?v={video_id}'])
         formats = d.get('formats') or []
         hls = [f for f in formats if str(f.get('protocol', '')).startswith('m3u8')]
         master = next((f.get('manifest_url') for f in hls if f.get('manifest_url')), None)
@@ -237,6 +256,123 @@ def video(video_id: str) -> dict[str, Any]:
                 'description': str(d.get('description') or '')[:600]}
     # stream addresses stay valid for a few hours; keep them two
     return _cached(f'v:{video_id}', 7200, make)
+
+
+_warm_next: list[str] = []
+_warm_busy = False
+_warm_lock = threading.Lock()
+
+
+def warm(video_id: str) -> str:
+    """Start looking a video up before it is opened (the lookup takes 15 to 18 s on this board).
+    One at a time, newest first: a card focused and left again is dropped from the queue."""
+    global _warm_busy
+    if not VIDEO_ID.fullmatch(video_id or ''):
+        raise ValueError('not a video id')
+    with _lock:
+        hit = _cache.get(f'v:{video_id}')
+        if hit and time.time() - hit[0] < 7200:
+            return 'ready'
+        if f'v:{video_id}' in _making:
+            return 'busy'
+    with _warm_lock:
+        _warm_next[:] = [video_id]
+        if _warm_busy:
+            return 'queued'
+        _warm_busy = True
+    threading.Thread(target=_warm_worker, daemon=True).start()
+    return 'started'
+
+
+def _warm_worker() -> None:
+    global _warm_busy
+    while True:
+        with _warm_lock:
+            if not _warm_next:
+                _warm_busy = False
+                return
+            vid = _warm_next.pop()
+        try:
+            video(vid, background=True)
+        except Exception:
+            pass   # opening the video will try again and show the error
+
+
+def _lockup_video(lv: dict[str, Any]) -> dict[str, Any] | None:
+    """One related video from YouTube's lockup layout (title, channel, length)."""
+    vid = str(lv.get('contentId') or '')
+    if lv.get('contentType') != 'LOCKUP_CONTENT_TYPE_VIDEO' or not VIDEO_ID.fullmatch(vid):
+        return None
+    meta = ((lv.get('metadata') or {}).get('lockupMetadataViewModel') or {})
+    title = str(((meta.get('title') or {}).get('content')) or '')
+    rows = (((meta.get('metadata') or {}).get('contentMetadataViewModel') or {}).get('metadataRows') or [])
+    channel = ''
+    if rows and (rows[0].get('metadataParts') or []):
+        channel = str(((rows[0]['metadataParts'][0].get('text') or {}).get('content')) or '')
+    badges: list = []
+    _walk(lv.get('contentImage') or {}, 'thumbnailBadgeViewModel', badges, 4)
+    duration, live = None, False
+    for b in badges:
+        text = str((b or {}).get('text') or '')
+        if re.fullmatch(r'\d{1,2}(:\d{2}){1,2}', text):
+            duration = _duration_seconds(text)
+        elif text.upper() == 'LIVE':
+            live = True
+    if not title:
+        return None
+    return {'id': vid, 'title': title[:200], 'channel': channel[:80], 'channel_id': None,
+            'duration': duration, 'live': live, 'thumb': _thumb(vid)}
+
+
+def related(video_id: str) -> list[dict[str, Any]]:
+    """What YouTube puts next to a video (its watch-next list), without ads or playlists."""
+    if not VIDEO_ID.fullmatch(video_id or ''):
+        raise ValueError('not a video id')
+    def make():
+        body = json.dumps({'context': {'client': INNERTUBE_CLIENT}, 'videoId': video_id}).encode()
+        data = json.loads(_https('www.youtube.com', 'POST', '/youtubei/v1/next?prettyPrint=false', body,
+                                 {'Content-Type': 'application/json'}))
+        found: list = []
+        _walk(data, 'lockupViewModel', found, 60)
+        out, seen = [], {video_id}
+        for lv in found:
+            item = _lockup_video(lv) if isinstance(lv, dict) else None
+            if item and item['id'] not in seen:
+                seen.add(item['id'])
+                out.append(item)
+        return out[:24]
+    return _cached(f'r:{video_id}', 1800, make)
+
+
+LIST_ID = re.compile(r'(?:RD|PL|OL|UU|FL|LL)[A-Za-z0-9_-]{8,64}')
+
+
+def playlist(list_id: str, video_id: str = '') -> dict[str, Any]:
+    """A mix or playlist as a queue: YouTube's watch-next panel for that list (about 25 videos).
+    A mix (RD + a video id) is YouTube's endless radio built from that video."""
+    if not LIST_ID.fullmatch(list_id or '') or (video_id and not VIDEO_ID.fullmatch(video_id)):
+        raise ValueError('not a playlist')
+    if not video_id and list_id.startswith('RD') and VIDEO_ID.fullmatch(list_id[2:]):
+        video_id = list_id[2:]
+    def make():
+        req: dict[str, Any] = {'context': {'client': INNERTUBE_CLIENT}, 'playlistId': list_id}
+        if video_id:
+            req['videoId'] = video_id
+        data = json.loads(_https('www.youtube.com', 'POST', '/youtubei/v1/next?prettyPrint=false', json.dumps(req).encode(),
+                                 {'Content-Type': 'application/json'}))
+        panel = ((((data.get('contents') or {}).get('twoColumnWatchNextResults') or {}).get('playlist') or {}).get('playlist') or {})
+        out, seen = [], set()
+        for entry in panel.get('contents') or []:
+            r = (entry or {}).get('playlistPanelVideoRenderer') or {}
+            vid = str(r.get('videoId') or '')
+            if not VIDEO_ID.fullmatch(vid) or vid in seen:
+                continue
+            seen.add(vid)
+            length = _text(r.get('lengthText'))
+            out.append({'id': vid, 'title': _text(r.get('title'))[:200], 'channel': _text(r.get('shortBylineText'))[:80],
+                        'channel_id': None, 'duration': _duration_seconds(length) if length else None, 'thumb': _thumb(vid)})
+        return {'id': list_id, 'title': _text(panel.get('title')) or str(panel.get('title') or '')[:120] or 'Queue', 'items': out[:200]}
+    return _cached(f'p:{list_id}:{video_id}', 1800, make)
 
 
 # ---- stream relay
@@ -722,6 +858,12 @@ class Handler(BaseHTTPRequestHandler):
                 # the TV gets the relay's playlist, never the googlevideo address (which it cannot read)
                 relay = f"/api/tv/stream?id={v['id']}" if v.get('hls') else None
                 self.reply(200, {'ok': True, **v, 'hls': relay})
+            elif url.path == '/warm':
+                self.reply(200, {'ok': True, 'state': warm(q.get('id', ''))})
+            elif url.path == '/playlist':
+                self.reply(200, {'ok': True, **playlist(q.get('list', ''), q.get('v', ''))})
+            elif url.path == '/related':
+                self.reply(200, {'ok': True, 'items': related(q.get('id', ''))})
             elif url.path == '/stream':
                 self.send_bytes(200, stream_master(q.get('id', '')).encode(), 'application/vnd.apple.mpegurl')
             elif url.path == '/hls':

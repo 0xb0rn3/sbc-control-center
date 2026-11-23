@@ -4,20 +4,19 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="robots" content="noindex">
-<title>TV · __SBC_DEVICE_LABEL__</title>
+<title>HomeTube · __SBC_DEVICE_LABEL__</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath fill='%23f0b9a5' d='M16 2.5 29.5 13.2V26a3.5 3.5 0 0 1-3.5 3.5H6A3.5 3.5 0 0 1 2.5 26V13.2Z'/%3E%3Cpath fill='%23141416' d='M13 13.2v10.6l8.6-5.3Z'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/assets/ui/tv.css">
 <script src="/assets/vendor/hls.min.js"></script>
 <script src="/assets/ui/tv.js" defer></script>
 </head>
 <body>
 <header class="tv-top">
-  <div class="tv-bar">
-    <div class="tv-brand"><span class="tv-logo" aria-hidden="true"></span>YouTube<small>no ads · through your VPN</small></div>
-    <form id="searchForm" class="tv-search" autocomplete="off">
-      <input id="q" type="search" placeholder="Search YouTube" data-nav aria-label="Search YouTube">
-      <button type="submit" data-nav>Search</button>
-    </form>
-  </div>
+  <div class="tv-brand"><svg class="tv-mark" viewBox="0 0 32 32" aria-hidden="true"><path class="house" d="M16 2.5 29.5 13.2V26a3.5 3.5 0 0 1-3.5 3.5H6A3.5 3.5 0 0 1 2.5 26V13.2Z"/><path class="play" d="M13 13.2v10.6l8.6-5.3Z"/></svg>HomeTube</div>
+  <form id="searchForm" class="tv-search" autocomplete="off">
+    <input id="q" type="search" placeholder="Search" data-nav aria-label="Search">
+    <button type="submit" data-nav>Search</button>
+  </form>
   <nav class="tv-tabs" aria-label="Sections">
     <button type="button" id="homeBtn" data-nav class="on">Home</button>
     <button type="button" id="recBtn" data-nav hidden>Recommended</button>
@@ -33,23 +32,46 @@
     <div id="grid" class="tv-grid"></div>
   </section>
 </main>
-<div id="player" class="tv-player" hidden>
-  <video id="video" playsinline></video>
-  <div id="info" class="tv-info">
-    <h3 id="vTitle"></h3>
-    <p id="vChannel"></p>
-    <div class="tv-info-actions">
-      <button type="button" id="subBtn" data-pnav>Subscribe</button>
-      <button type="button" id="channelBtn" data-pnav>Channel</button>
-      <button type="button" id="laterAdd" data-pnav>Watch Later</button>
-      <select id="qSel" data-pnav aria-label="Quality"><option value="-1">Auto quality</option></select>
-      <select id="speedSel" data-pnav aria-label="Speed"><option value="0.75">0.75×</option><option value="1" selected>1× speed</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select>
-      <select id="ccSel" data-pnav aria-label="Subtitles"><option value="">Subtitles off</option></select>
-      <select id="chapSel" data-pnav aria-label="Chapters" hidden></select>
-      <button type="button" id="closeBtn" data-pnav>Back</button>
-    </div>
-    <p class="tv-keys">OK: pause or play · ◀ ▶: 10 seconds · Back: close</p>
+<div id="player" class="tv-player full" hidden>
+  <div class="tv-stage">
+    <video id="video" playsinline></video>
+    <div id="spin" class="tv-spin" hidden><i></i><span id="spinText">Opening…</span></div>
   </div>
+  <div id="dock" class="tv-dock">
+    <div class="tv-details">
+      <h3 id="vTitle"></h3>
+      <p id="vChannel"></p>
+      <div class="tv-progress" aria-hidden="true"><span id="tCur">0:00</span><div class="tv-track"><i id="tBuf"></i><i id="tPos"></i></div><span id="tDur">0:00</span></div>
+      <div class="tv-transport">
+        <button type="button" id="prevBtn" data-pnav><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6h2v12H6zm3.5 6 8.5 6V6z"/></svg>Previous</button>
+        <button type="button" id="backTen" data-pnav>−10 s</button>
+        <button type="button" id="playBtn" data-pnav class="tv-main"><svg viewBox="0 0 24 24" aria-hidden="true"><path id="playIcon" d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg><span id="playLabel">Pause</span></button>
+        <button type="button" id="fwdTen" data-pnav>+10 s</button>
+        <button type="button" id="nextBtn" data-pnav><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/></svg>Next</button>
+        <button type="button" id="mixBtn" data-pnav><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 6H3v2h12V6zm0 4H3v2h12v-2zM3 16h8v-2H3v2zM17 6v8.18A2.99 2.99 0 0 0 16 14a3 3 0 1 0 3 3V8h3V6h-5z"/></svg>Mix</button>
+        <button type="button" id="fsBtn" data-pnav><svg viewBox="0 0 24 24" aria-hidden="true"><path id="fsIcon" d="M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z"/></svg><span id="fsLabel">Exit full screen</span></button>
+        <button type="button" id="closeBtn" data-pnav><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg>Back</button>
+      </div>
+      <div class="tv-info-actions">
+        <button type="button" id="subBtn" data-pnav>Subscribe</button>
+        <button type="button" id="channelBtn" data-pnav>Channel</button>
+        <button type="button" id="laterAdd" data-pnav>Watch Later</button>
+        <select id="qSel" data-pnav aria-label="Quality"><option value="-1">Auto quality</option></select>
+        <select id="speedSel" data-pnav aria-label="Speed"><option value="0.75">0.75×</option><option value="1" selected>1× speed</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select>
+        <select id="ccSel" data-pnav aria-label="Subtitles"><option value="">Subtitles off</option></select>
+        <select id="chapSel" data-pnav aria-label="Chapters" hidden></select>
+      </div>
+    </div>
+    <section class="tv-related">
+      <div class="tv-lower-tabs" role="tablist">
+        <button type="button" id="tabQueue" data-pnav role="tab">Queue</button>
+        <button type="button" id="tabNext" data-pnav role="tab">Up next</button>
+      </div>
+      <div id="queueStrip" class="tv-strip tv-rel" hidden></div>
+      <div id="relStrip" class="tv-strip tv-rel" hidden></div>
+    </section>
+  </div>
+  <div id="upnext" class="tv-upnext" hidden><span>Up next in <b id="upnextSec">5</b></span><strong id="upnextTitle"></strong><small>OK: play now · Back: stay</small></div>
 </div>
 </body>
 </html>

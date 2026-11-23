@@ -1160,7 +1160,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.relay_tube('/' + path[8:] + ('?' + parsed.query if parsed.query else ''))
             return
-        if path.startswith('/api/tv/') and path[8:] in ('search', 'video', 'channel', 'home', 'history', 'later', 'captions', 'account', 'feed'):
+        if path.startswith('/api/tv/') and path[8:] in ('search', 'video', 'channel', 'home', 'history', 'later', 'captions', 'account', 'feed', 'related', 'warm', 'playlist'):
             if not tube_allowed(client_ip(self)):
                 self.send_json(429, {'ok': False, 'error': 'Too many requests; wait a minute.'})
                 return
