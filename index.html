@@ -1727,7 +1727,7 @@ function initDisplayControls(){
   $('standbyBtn').addEventListener('click',start);$('standbyStartBtn').addEventListener('click',start);
 }
 if(window.SbcSlideshow){
-  lrPictures=new SbcSlideshow($('lrPictures'),{interval:displaySettings().standbyInterval*1000,collection:'moodboard',fit:'contain-blur',fallback:false});
+  lrPictures=new SbcSlideshow($('lrPictures'),{interval:displaySettings().standbyInterval*1000,collection:'moodboard',fallback:false});
   lrPictures.load().then(n=>{lrPicturesCount=n;const m=$('moodboardCount');if(m)m.textContent=n?`${n} mood board picture(s) for the living room.`:'No mood board yet: the living room shows the wallpapers.';});
   slideshow=new SbcSlideshow($('sbcBackdrop'),{interval:displaySettings().bgInterval*1000});
   slideshow.load().then(count=>{$('wallpaperCount').textContent=count>1?`${count} wallpapers in the slideshow.`:'No wallpapers on this server yet: the built-in background is shown.';applyDisplaySettings();if(displaySettings().bg!=='on')slideshow.sync(true);});

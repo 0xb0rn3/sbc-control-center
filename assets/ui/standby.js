@@ -8,7 +8,7 @@
   // the mood board when it has pictures (unless ?pictures=wallpapers), the wallpapers otherwise
   var host = document.getElementById('backdrop');
   var wantWalls = /[?&]pictures=wallpapers/.test(location.search);
-  var board = new window.SbcSlideshow(host, {interval: seconds * 1000, collection: 'moodboard', fit: 'contain-blur', fallback: false});
+  var board = new window.SbcSlideshow(host, {interval: seconds * 1000, collection: 'moodboard', fallback: false});
   (wantWalls ? Promise.resolve(0) : board.load()).then(function (count) {
     if (count > 0) { board.start(); return; }
     while (host.firstChild) host.removeChild(host.firstChild);

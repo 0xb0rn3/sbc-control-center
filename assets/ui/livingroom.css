@@ -26,9 +26,12 @@
   .lr-clock { top: 40%; }
   .lr-quote { width: calc(100vw - 40px); bottom: clamp(20px, 5vh, 48px); }
 }
-/* a slideshow of whole pictures (the mood board) over a blurred copy of each */
-.sbc-slide.contain .sbc-blur, .sbc-slide.contain .sbc-fg { position: absolute; inset: 0; background-position: center; background-repeat: no-repeat; }
-.sbc-slide.contain .sbc-blur { background-size: cover; filter: blur(38px) brightness(.5) saturate(1.15); transform: scale(1.2); }
-.sbc-slide.contain .sbc-fg { background-size: contain; }
+/* slideshow pictures: filling the screen, or (when the shape does not fit) whole over a blurred copy */
+.sbc-slide.fit .sbc-blur, .sbc-slide.fit .sbc-fg { position: absolute; inset: 0; background-repeat: no-repeat; }
+.sbc-slide.fit { overflow: hidden; }
+.sbc-slide.fit .sbc-fg { background-size: cover; background-position: center 34%; }
+.sbc-slide.fit .sbc-blur { display: none; background-size: cover; background-position: center; filter: blur(38px) brightness(.5) saturate(1.15); transform: scale(1.2); }
+.sbc-slide.fit.contain .sbc-blur { display: block; }
+.sbc-slide.fit.contain .sbc-fg { background-size: contain; background-position: center; }
 .lr-pictures { position: fixed; inset: 0; z-index: 4; background: #08090c; }
 @media (prefers-reduced-motion: reduce) { .lr-quote { transition: none; } }

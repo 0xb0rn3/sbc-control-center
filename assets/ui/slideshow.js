@@ -8,6 +8,11 @@
  *   const show = new SbcSlideshow(document.getElementById('backdrop'), {interval: 300000});
  *   show.start(); show.setInterval(30000); show.next(); show.stop();
  *
+ * Pictures that do not fit are resized automatically (fit 'auto', the default): one whose shape is
+ * close to the screen's fills it (a little cropped at the edges); one much taller or wider (a
+ * portrait pin on a TV, an ultra-wide wallpaper) is shown whole, centred over a blurred copy of
+ * itself, so nothing important is cut off. 'cover' and 'contain-blur' force one or the other.
+ *
  * Two layers cross-fade; the next picture is fully downloaded and decoded before it is shown,
  * so a slow TV browser never flashes a half-drawn image. As on the ArxOS lock screen, the
  * picture follows the clock: the order is a fixed shuffle of the list and the slot is the
@@ -39,12 +44,16 @@
     return a;
   }
 
+  // how far a picture's shape may differ from the screen's before it is shown whole instead of filling
+  var FIT_TOLERANCE = 1.3;
+
   function preload(url) {
     return new Promise(function (resolve, reject) {
       var img = new Image();
       img.onload = function () {
-        if (img.decode) { img.decode().then(function () { resolve(url); }, function () { resolve(url); }); }
-        else { resolve(url); }
+        var size = {url: url, w: img.naturalWidth || 0, h: img.naturalHeight || 0};
+        if (img.decode) { img.decode().then(function () { resolve(size); }, function () { resolve(size); }); }
+        else { resolve(size); }
       };
       img.onerror = function () { reject(new Error('could not load ' + url)); };
       img.src = url;
@@ -58,7 +67,7 @@
     // 'wallpapers' (the dashboard's) or 'moodboard' (the Pinterest board, for the living room)
     this.collection = /^(wallpapers|moodboard)$/.test(options.collection || '') ? options.collection : 'wallpapers';
     // 'cover' fills the screen; 'contain-blur' shows the whole picture over a blurred copy of itself
-    this.fit = options.fit === 'contain-blur' ? 'contain-blur' : 'cover';
+    this.fit = options.fit === 'contain-blur' || options.fit === 'cover' ? options.fit : 'auto';
     this.fallback = options.fallback !== false;
     this.list = [];
     this.order = [];
@@ -69,14 +78,18 @@
     this.layers = [document.createElement('div'), document.createElement('div')];
     this.front = 0;
     for (var i = 0; i < 2; i++) {
-      this.layers[i].className = 'sbc-slide' + (this.fit === 'contain-blur' ? ' contain' : '');
-      if (this.fit === 'contain-blur') {
-        var blur = document.createElement('div'); blur.className = 'sbc-blur';
-        var fg = document.createElement('div'); fg.className = 'sbc-fg';
-        this.layers[i].appendChild(blur); this.layers[i].appendChild(fg);
-      }
+      // every layer can show a picture either way: a blurred copy behind, the picture in front
+      this.layers[i].className = 'sbc-slide fit';
+      var blur = document.createElement('div'); blur.className = 'sbc-blur';
+      var fg = document.createElement('div'); fg.className = 'sbc-fg';
+      this.layers[i].appendChild(blur); this.layers[i].appendChild(fg);
       host.appendChild(this.layers[i]);
     }
+    this.shown = [null, null];
+    var self = this;
+    window.addEventListener('resize', function () {   // a rotated phone or a resized window: decide again
+      for (var k = 0; k < 2; k++) if (self.shown[k]) self.layers[k].classList.toggle('contain', self.wantsWhole(self.shown[k]));
+    });
   }
 
   SbcSlideshow.prototype.load = function () {
@@ -95,12 +108,24 @@
       });
   };
 
-  SbcSlideshow.prototype.show = function (url) {
-    var back = this.layers[1 - this.front];
+  // whole picture (over its blurred copy) or filling the screen, for this picture on this screen
+  SbcSlideshow.prototype.wantsWhole = function (size) {
+    if (this.fit !== 'auto') return this.fit === 'contain-blur';
+    var screen = (this.host.clientWidth || window.innerWidth) / Math.max(1, this.host.clientHeight || window.innerHeight);
+    if (!size || !size.w || !size.h || !screen) return false;
+    var ratio = (size.w / size.h) / screen;
+    return ratio > FIT_TOLERANCE || ratio < 1 / FIT_TOLERANCE;
+  };
+
+  SbcSlideshow.prototype.show = function (size) {
+    var idx = 1 - this.front;
+    var back = this.layers[idx];
     var front = this.layers[this.front];
-    var css = 'url("' + url.replace(/"/g, '%22') + '")';
-    if (this.fit === 'contain-blur') { back.firstChild.style.backgroundImage = css; back.lastChild.style.backgroundImage = css; }
-    else back.style.backgroundImage = css;
+    var css = 'url("' + size.url.replace(/"/g, '%22') + '")';
+    back.firstChild.style.backgroundImage = css;
+    back.lastChild.style.backgroundImage = css;
+    back.classList.toggle('contain', this.wantsWhole(size));
+    this.shown[idx] = size;
     back.classList.add('on');
     front.classList.remove('on');
     this.front = 1 - this.front;
@@ -119,7 +144,7 @@
     var tries = 0;
     function attempt() {
       var url = self.order[(slot + self.offset) % self.order.length];
-      return preload(url).then(function () { self.slot = slot; self.show(url); }, function () {
+      return preload(url).then(function (size) { self.slot = slot; self.show(size); }, function () {
         self.offset++;
         if (++tries < 5) return attempt();
       });
