@@ -135,6 +135,7 @@ def install_units() -> None:
     (unit_dir / f'{SUMMARY_UNIT}.service').write_text(service)
     (unit_dir / f'{SUMMARY_UNIT}.timer').write_text(timer)
     SUMMARY_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.sync()   # flush before enabling: unflushed unit files can come back empty after a power cut
     subprocess.run(['systemctl', 'daemon-reload'], check=True)
     subprocess.run(['systemctl', 'enable', '--now', f'{UNIT}.service', f'{SUMMARY_UNIT}.timer'], check=True)
     print(f'{UNIT} recording {", ".join(i for i, _ in capture_interfaces())}; summaries every 15 min')

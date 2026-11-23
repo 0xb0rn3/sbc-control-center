@@ -79,6 +79,8 @@ def save_state(state: dict[str, Any]) -> None:
     fd, tmp = tempfile.mkstemp(prefix='.devroute.', dir=str(STATE_PATH.parent))
     with os.fdopen(fd, 'w') as handle:
         json.dump(state, handle, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
     os.chmod(tmp, 0o640)
     os.replace(tmp, STATE_PATH)
 
@@ -168,6 +170,8 @@ def apply(state: dict[str, Any]) -> dict[str, Any]:
         (work / 'apguard.nft.before-devroute').write_text(source, encoding='utf-8')
         with open(path, 'w', encoding='utf-8') as live:   # same file, rewritten in place
             live.write(candidate)
+            live.flush()
+            os.fsync(live.fileno())   # on flash with a long commit interval, unflushed writes can be lost to a power cut
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
@@ -243,6 +247,7 @@ ExecStart=/usr/bin/python3 -I {sbc_site.APP_DIR}/devroute.py ensure
 WantedBy=multi-user.target
 """
     Path(f'/etc/systemd/system/{sbc_site.PREFIX}-devroute.service').write_text(unit)
+    os.sync()   # flush before enabling: unflushed unit files can come back empty after a power cut
     subprocess.run(['systemctl', 'daemon-reload'], check=True)
     subprocess.run(['systemctl', 'enable', '--now', f'{sbc_site.PREFIX}-devroute.service'], check=True)
 

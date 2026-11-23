@@ -40,6 +40,8 @@ ExecStart=/usr/bin/suricata -D -c /etc/suricata/suricata.yaml --pidfile /run/sur
 # low-memory matching: the full ET Open set otherwise needs more than 1 GB on a small board
 MemoryHigh=1200M
 MemoryMax=1600M
+# /var/log is in memory on Armbian: let systemd create Suricata's log folder at every start
+LogsDirectory=suricata
 Nice=5
 Restart=on-failure
 RestartSec=30
@@ -83,6 +85,7 @@ def install_units() -> None:
     subprocess.run(['systemctl', 'reset-failed', 'suricata.service'], check=False)
     subprocess.run(['systemctl', 'enable', '--now', f'{RULES_UNIT}.timer'], check=True)
     subprocess.run(['systemctl', 'enable', 'suricata.service'], check=True)
+    os.sync()
     subprocess.run(['systemctl', 'restart', 'suricata.service'], check=True)
     print(f"suricata watching {', '.join(sbc_site.ap_interfaces(SITE))}; rules update daily ({RULES_UNIT}.timer)")
 

@@ -22,7 +22,9 @@ import stat
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -70,6 +72,38 @@ STATIC_TYPES = {'.js': 'text/javascript; charset=utf-8', '.css': 'text/css; char
                 '.woff2': 'font/woff2', '.svg': 'image/svg+xml'}
 STATIC_PATH = re.compile(r'/assets/(vendor|ui|wallpapers)/([A-Za-z0-9][A-Za-z0-9_.-]{0,120})')
 STANDBY_PATH = sbc_site.APP_DIR / 'standby.html'
+TV_PATH = sbc_site.APP_DIR / 'tv.html'
+TUBE_URL = 'http://127.0.0.1:8891'
+_tube_hits: dict[str, list[float]] = {}
+_tube_lock = threading.Lock()
+
+
+def tube_allowed(ip: str, limit: int = 40, window: float = 60.0) -> bool:
+    """No sign-in on the TV page, so each address gets a bounded number of tube requests a minute."""
+    now = time.time()
+    with _tube_lock:
+        hits = [t for t in _tube_hits.get(ip, []) if now - t < window]
+        if len(hits) >= limit:
+            _tube_hits[ip] = hits
+            return False
+        hits.append(now)
+        _tube_hits[ip] = hits
+        if len(_tube_hits) > 2000:
+            _tube_hits.clear()
+        return True
+
+
+def tube_request(path: str, body: bytes | None = None) -> tuple[int, bytes]:
+    req = urllib.request.Request(TUBE_URL + path, data=body, method='POST' if body is not None else 'GET',
+                                 headers={'Content-Type': 'application/json'})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=50) as resp:
+            return resp.status, resp.read(4_000_000)
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read(100_000)
+    except Exception:
+        return 503, b'{"ok":false,"error":"The YouTube service is not running."}'
 WALLPAPER_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,120}\.(?:jpe?g|webp|png)')
 
 
@@ -601,7 +635,7 @@ class Handler(BaseHTTPRequestHandler):
         # Avoid logging cookies, request bodies, or credentials.
         print(f'[{self.log_date_time_string()}] {client_ip(self)} {fmt % args}', flush=True)
 
-    def security_headers(self, nonce: str | None = None, cache: str = 'no-store') -> None:
+    def security_headers(self, nonce: str | None = None, cache: str = 'no-store', media: bool = False) -> None:
         # one Cache-Control header only: a second one would combine with no-store and disable caching
         self.send_header('Cache-Control', cache)
         self.send_header('X-Content-Type-Options', 'nosniff')
@@ -614,7 +648,13 @@ class Handler(BaseHTTPRequestHandler):
         # creates a plaintext HTTP listener or redirect endpoint.
         if isinstance(self.connection, ssl.SSLSocket):
             self.send_header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
-        if nonce:
+        if nonce and media:
+            # the TV page: thumbnails from YouTube's image host, video segments from its video hosts
+            csp = (f"default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'nonce-{nonce}'; "
+                   "img-src 'self' data: https://i.ytimg.com; media-src 'self' blob: https://*.googlevideo.com https://*.youtube.com; "
+                   "connect-src 'self' https://*.googlevideo.com https://*.youtube.com https://manifest.googlevideo.com; "
+                   "worker-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
+        elif nonce:
             csp = (f"default-src 'self'; style-src 'self' 'unsafe-inline'; "
                    f"script-src 'self' 'nonce-{nonce}'; img-src 'self' data:; "
                    "connect-src 'self'; object-src 'none'; base-uri 'none'; "
@@ -1043,6 +1083,33 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if path == '/tv':
+            try:
+                body = TV_PATH.read_bytes()
+            except OSError:
+                self.send_error(404, 'TV page not installed')
+                return
+            for token, value in PAGE_TOKENS:
+                body = body.replace(token, value)
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.security_headers(secrets.token_urlsafe(18), media=True)
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path.startswith('/api/tv/') and path[8:] in ('search', 'video', 'channel', 'home', 'history', 'later', 'captions'):
+            if not tube_allowed(client_ip(self)):
+                self.send_json(429, {'ok': False, 'error': 'Too many requests; wait a minute.'})
+                return
+            status, body = tube_request('/' + path[8:] + ('?' + parsed.query if parsed.query else ''))
+            self.send_response(status)
+            self.send_header('Content-Type', 'text/vtt; charset=utf-8' if path.endswith('/captions') and status == 200 else 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.security_headers()
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if path in ('/standby', '/living-room'):
             try:
                 body = STANDBY_PATH.read_bytes()
@@ -1300,6 +1367,23 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == '/api/vpn/import':
             self.handle_vpn_import()
+            return
+        if path in ('/api/tv/subscribe', '/api/tv/history', '/api/tv/later', '/api/tv/takeout'):
+            if not tube_allowed(client_ip(self)):
+                self.send_json(429, {'ok': False, 'error': 'Too many requests; wait a minute.'})
+                return
+            try:
+                data = self.read_json()
+            except Exception as exc:
+                self.send_json(400, {'ok': False, 'error': str(exc)})
+                return
+            status, body = tube_request('/' + path[8:], json.dumps({k: data.get(k) for k in ('id', 'name', 'add', 'item', 'remove', 'csv')}).encode())
+            self.send_response(status)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.security_headers()
+            self.end_headers()
+            self.wfile.write(body)
             return
         try:
             data = self.read_json()
