@@ -12,7 +12,11 @@ User=kickpi-p0f
 Group=kickpi-p0f
 LogsDirectory=kickpi-p0f
 LogsDirectoryMode=0750
-ExecStart=/usr/sbin/p0f -q -i %i -f /etc/p0f/p0f.fp -o /var/log/kickpi-p0f/%i.log -m 500,2000
+# p0f 3 has no quiet option: its per-connection lines go to stdout, which is dropped (the log file has
+# them; the journal is in RAM on small boards). Its errors still reach the journal.
+ExecStart=/usr/sbin/p0f -i %i -f /etc/p0f/p0f.fp -o /var/log/kickpi-p0f/%i.log -m 500,2000
+StandardOutput=null
+StandardError=journal
 Restart=on-failure
 RestartSec=3
 UMask=0027
