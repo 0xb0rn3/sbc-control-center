@@ -211,9 +211,9 @@ def classify(row):
         if destination == "100.64.0.23":
             event_type = "configured_upstream_direct_dns_attempt"
             confidence = "medium"
-            evidence = query or "DNS request to configured Mullvad upstream"
+            evidence = query or "DNS request to the configured upstream resolver"
             expected_policy = (
-                "Client addressed the configured Mullvad upstream directly. "
+                "Client addressed the configured upstream resolver directly. "
                 "AP prerouting DNAT should redirect this query to local AdGuard; "
                 "this observation does not establish a successful bypass."
             )

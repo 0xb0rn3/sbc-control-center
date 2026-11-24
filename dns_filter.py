@@ -80,6 +80,39 @@ AP_DEFAULTS = {
 }
 
 
+# no VPN on the board: encrypted DNS straight to two public resolvers, by address (no bootstrap lookup)
+DIRECT_UPSTREAMS = ['https://9.9.9.9/dns-query', 'https://1.1.1.1/dns-query']
+
+
+def vpn_on() -> bool:
+    """A tunnel is set up on this board. Without one, DNS filtering works the same, asking the public
+    resolvers directly: a VPN is something to add, never a requirement."""
+    return Path(f"/etc/wireguard/{_SITE['vpn_interface']}.conf").is_file()
+
+
+def _upstream_named() -> bool:
+    try:
+        raw = json.loads(DNS_CONFIG.read_text(encoding='utf-8'))
+        return isinstance(raw, dict) and 'upstream' in raw
+    except Exception:
+        return False
+
+
+def upstream_servers(integration: dict[str, Any]) -> list[str]:
+    """Who AdGuard asks: the resolver named in dns-filter.json; else, with a VPN, the provider's own
+    (from its config's DNS line, inside the tunnel); without a VPN, encrypted public resolvers."""
+    if not vpn_on():
+        return list(DIRECT_UPSTREAMS)
+    if _upstream_named():
+        return [integration['upstream']]
+    try:
+        import vpn_library
+        own = vpn_library.conf_dns(Path(f"/etc/wireguard/{_SITE['vpn_interface']}.conf").read_text(encoding='utf-8'))
+    except Exception:
+        own = []
+    return own or [integration['upstream']]
+
+
 def tv_configured(config: dict[str, Any]) -> bool:
     return bool(config.get('vidaa_ip') and config.get('vidaa_mac'))
 
@@ -296,7 +329,7 @@ def _make_agh_config(document: dict[str, Any], profile: str, integration: dict[s
         raise RuntimeError('AdGuard Home dns configuration is not a mapping.')
     dns['bind_hosts'] = ['127.0.0.1', integration['ap2_ip'], integration['ap5_ip']]
     dns['port'] = 53
-    dns['upstream_dns'] = [integration['upstream']]
+    dns['upstream_dns'] = upstream_servers(integration)
     dns['bootstrap_dns'] = []
     dns['fallback_dns'] = []
     dns['allowed_clients'] = ['127.0.0.1', integration['ap2_subnet'], integration['ap5_subnet']]
@@ -505,6 +538,16 @@ def _ensure_uid_route() -> None:
         uid = pwd.getpwnam('adguardhome').pw_uid
     except KeyError as exc:
         raise RuntimeError('The dedicated adguardhome account is missing. Run the network-filtering installer first.') from exc
+    if not vpn_on():
+        # no VPN on this board: AdGuard asks its public resolvers directly. A rule left from a VPN that is
+        # gone would send it into an empty table (no DNS at all), so it goes
+        for _ in range(10):
+            if _run(['/usr/sbin/ip', '-4', 'rule', 'del', 'uidrange', f'{uid}-{uid}', 'lookup', str(integration['route_table'])])[0] != 0:
+                break
+        probe_rc, probe = _run(['/usr/sbin/ip', '-4', 'route', 'get', DIRECT_UPSTREAMS[0].split('/')[2], 'uid', str(uid)], timeout=5)
+        if probe_rc != 0 or 'unreachable' in probe:
+            raise RuntimeError('AdGuard cannot reach its public resolvers: ' + probe)
+        return
     # The policy table already carries default dev <vpn> plus an unreachable fallback.
     vpn_dev = f"dev {_SITE['vpn_interface']}"
     route = _run(['/usr/sbin/ip', '-4', 'route', 'show', 'table', str(integration['route_table'])])[1]

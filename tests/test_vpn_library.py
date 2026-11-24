@@ -218,6 +218,7 @@ class AlwaysFastestTests(unittest.TestCase):
             mock.patch.object(vl, 'switch', side_effect=self.fake_switch),
             mock.patch.object(vl, 'second_up', side_effect=self.fake_second_up),
             mock.patch.object(vl, '_hometube', side_effect=lambda path, timeout: self.ht.get(path)),
+            mock.patch.object(vl, 'vpn_present', return_value=True),
         ]
         for f in self.fakes:
             f.start()
@@ -257,7 +258,8 @@ class AlwaysFastestTests(unittest.TestCase):
         self.checked()
         self.alive[vl.IFACE] = False
         self.assertIsNone(vl.autopick_tick())                      # one missed check: not yet
-        result = vl.autopick_tick()                                # two in a row: move
+        self.assertIsNone(vl.autopick_tick())                      # two: still not (a bad minute is not a dead server)
+        result = vl.autopick_tick()                                # three in a row: move
         self.assertTrue(result['ok'])
         self.assertEqual(self.switched, [('za-jnb-wg-002', 'auto: no answer')])   # -001 is HomeTube's
         self.assertEqual(self.seconds, [])
@@ -266,9 +268,11 @@ class AlwaysFastestTests(unittest.TestCase):
         self.checked()
         self.alive[vl.IFACE] = False
         self.dead = {'za-jnb-wg-002'}
-        vl.autopick_tick(); vl.autopick_tick()
+        vl.autopick_tick(); vl.autopick_tick(); vl.autopick_tick()
         self.assertEqual(self.switched, [('ng-los-wg-001', 'auto: no answer')])
-        self.assertIn('za-jnb-wg-002', vl._state()['avoid'])
+        avoid = vl._state()['avoid']
+        self.assertIn('za-jnb-wg-002', avoid)                     # failed to connect
+        self.assertIn('us-hou-wg-001', avoid)                     # the one that stopped answering
 
     def test_youtube_refusing_moves_hometubes_tunnel_and_waits_for_youtube_to_answer(self):
         self.checked()
@@ -319,3 +323,94 @@ class AlwaysFastestTests(unittest.TestCase):
         with mock.patch.object(vl, 'exit_info', return_value=None):
             codes = [c['code'] for c in vl.library()['countries']]
         self.assertEqual(codes, ['za', 'ng', 'es', 'us'])
+
+
+class AnyProviderNoVpnTests(unittest.TestCase):
+    """No VPN is a normal way to run; any provider's WireGuard configs work."""
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        (self.tmp / 'vpn').mkdir()
+        self.patchers = [mock.patch.object(vl, k, v) for k, v in {
+            'LIB_DIR': self.tmp / 'vpn', 'SERVERS_PATH': self.tmp / 'vpn/servers.json', 'KEYS_PATH': self.tmp / 'vpn/keys.json',
+            'STATE_PATH': self.tmp / 'vpn/state.json', 'CONF_PATH': self.tmp / 'wg0.conf'}.items()]
+        for p in self.patchers:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patchers:
+            p.stop()
+        shutil.rmtree(self.tmp)
+
+    def test_no_tunnel_means_nothing_to_watch(self):
+        self.assertFalse(vl.vpn_present())
+        with mock.patch.object(vl, '_tunnel_answers', side_effect=AssertionError('must not probe a tunnel that is not there')):
+            self.assertIsNone(vl.autopick_tick())
+
+    def test_probes_use_the_providers_own_resolver_then_public_ones(self):
+        (self.tmp / 'wg0.conf').write_text('[Interface]\nPrivateKey = x\nDNS = 10.2.0.1, search.example\n\n[Peer]\nPublicKey = y\n')
+        self.assertEqual(vl.probe_targets(), ['10.2.0.1', '1.1.1.1', '9.9.9.9'])
+        (self.tmp / 'wg0.conf').write_text('[Interface]\nPrivateKey = x\n')
+        self.assertEqual(vl.probe_targets()[0], vl.PROBE_ADDRESS)   # no DNS named: Mullvad's, then the public ones
+        answers = {'10.64.0.1': 1, '1.1.1.1': 0}
+        with mock.patch.object(vl, '_run', side_effect=lambda cmd, timeout=0: (answers.get(cmd[-1], 1), 'rtt = 1/2/3 ms')):
+            ok, who, _ = vl._ping_through('wg0')
+        self.assertEqual((ok, who), (True, '1.1.1.1'))               # one provider address silent: still alive
+
+    def test_imported_configs_keep_their_dns_and_switching_applies_it(self):
+        conf = (f'[Interface]\nPrivateKey = {KEY_A}\nAddress = 10.2.0.2/32\nDNS = 10.2.0.1\n\n'
+                '[Peer]\nPublicKey = ' + KEY_B + '\nAllowedIPs = 0.0.0.0/0\nEndpoint = 185.213.154.68:51820\n')
+        with mock.patch.object(vl, 'public_key_of', return_value=KEY_B):
+            vl.import_configs(conf.encode(), 'proton-ch-12.conf')
+        server = vl._load_servers()['servers'][0]
+        self.assertEqual(server['dns'], ['10.2.0.1'])
+        live = '[Interface]\nPrivateKey = old\nAddress = 10.64.1.2/32\nDNS = 10.64.0.1\nTable = off\n\n[Peer]\nPublicKey = z\n'
+        out = vl._render_conf(live, None, None, server)
+        self.assertIn('DNS = 10.2.0.1\n', out); self.assertNotIn('10.64.0.1', out)
+        self.assertIn('Table = off', out)
+
+    def test_a_first_connection_makes_the_tunnel_and_a_failed_one_leaves_no_trace(self):
+        conf = (f'[Interface]\nPrivateKey = {KEY_A}\nAddress = 10.2.0.2/32\nDNS = 10.2.0.1\n\n'
+                '[Peer]\nPublicKey = ' + KEY_B + '\nAllowedIPs = 0.0.0.0/0\nEndpoint = 185.213.154.68:51820\n')
+        with mock.patch.object(vl, 'public_key_of', return_value=KEY_B):
+            vl.import_configs(conf.encode(), 'my-own-server.conf')
+        host = vl._load_servers()['servers'][0]['hostname']
+        calls = []
+        with mock.patch.object(vl, '_run', side_effect=lambda cmd, timeout=0: (calls.append(cmd) or (0, ''))), \
+             mock.patch.object(vl, '_apply'), mock.patch.object(vl, '_verify', return_value=False), \
+             mock.patch.object(vl, '_wg_dump', return_value={}):
+            with self.assertRaises(vl.VpnError):
+                vl.switch(host)
+        self.assertFalse(vl.vpn_present())                          # nothing left behind: still no VPN
+        self.assertTrue(any('disable' in c for c in calls))
+        written = []
+        with mock.patch.object(vl, '_run', return_value=(0, '')), mock.patch.object(vl, '_apply', side_effect=lambda text, restart: written.append(text)), \
+             mock.patch.object(vl, '_verify', return_value=True), mock.patch.object(vl, '_wg_dump', return_value={}), \
+             mock.patch.object(vl, 'exit_info', return_value=None):
+            self.assertTrue(vl.switch(host)['ok'])
+        self.assertTrue(vl.vpn_present())
+        self.assertIn('Table = off', written[0]); self.assertIn('table 200', written[0]); self.assertIn('DNS = 10.2.0.1', written[0])
+        self.assertIn('Endpoint = 185.213.154.68:51820', written[0])
+
+
+class NamedEndpointTests(unittest.TestCase):
+    def test_a_server_named_by_hostname_is_looked_up_once(self):
+        with mock.patch.object(vl.socket, 'getaddrinfo', return_value=[(2, 2, 17, '', ('185.213.154.68', 51820))]):
+            self.assertEqual(vl._valid_endpoint('ch.vpn.example.net:51820'), ('185.213.154.68', 51820))
+        with mock.patch.object(vl.socket, 'getaddrinfo', return_value=[(2, 2, 17, '', ('10.0.0.5', 51820))]):
+            self.assertIsNone(vl._valid_endpoint('lan.example.net:51820'))    # private: would loop
+        with mock.patch.object(vl.socket, 'getaddrinfo', side_effect=OSError('no such host')):
+            self.assertIsNone(vl._valid_endpoint('gone.example.net:51820'))
+        self.assertIsNone(vl._valid_endpoint('not a host:1'))
+
+
+class PresharedKeyTests(AnyProviderNoVpnTests):
+    def test_a_preshared_key_is_kept_and_written(self):
+        psk = 'cGVlcmtleWNjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2M='
+        conf = (f'[Interface]\nPrivateKey = {KEY_A}\nAddress = 10.8.0.2/32\n\n'
+                f'[Peer]\nPublicKey = {KEY_B}\nPresharedKey = {psk}\nAllowedIPs = 0.0.0.0/0\nEndpoint = 185.213.154.68:51820\n')
+        with mock.patch.object(vl, 'public_key_of', return_value=KEY_B):
+            vl.import_configs(conf.encode(), 'home-vps.conf')
+        server = vl._load_servers()['servers'][0]
+        self.assertNotIn(psk, json.dumps(server))                  # not in the server list, only with the keys
+        out = vl._render_conf('[Interface]\nPrivateKey = x\nTable = off\n', None, None, server)
+        self.assertIn(f'PresharedKey = {psk}\n', out)

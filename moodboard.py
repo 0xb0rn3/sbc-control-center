@@ -37,7 +37,7 @@ PIN_IMAGE = re.compile(r'https://i\.pinimg\.com/[0-9a-z]+x?/[0-9a-f/]+\.(?:jpg|j
 
 def _fetch(url: str, limit: int) -> bytes | None:
     try:
-        cp = subprocess.run([CURL, '-fsSL', '--max-time', '40', '--max-filesize', str(limit), '--interface', SITE['vpn_interface'],
+        cp = subprocess.run([CURL, '-fsSL', '--max-time', '40', '--max-filesize', str(limit), *sbc_site.through_vpn(SITE),
                              '-A', 'Mozilla/5.0', url], capture_output=True, timeout=50)
     except (OSError, subprocess.TimeoutExpired):
         return None

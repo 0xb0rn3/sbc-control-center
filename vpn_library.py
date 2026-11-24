@@ -28,6 +28,7 @@ import os
 import random
 import re
 import secrets
+import socket
 import subprocess
 import tempfile
 import threading
@@ -51,7 +52,8 @@ STATE_PATH = LIB_DIR / 'state.json'
 WG_DIR = Path('/etc/wireguard')
 CONF_PATH = WG_DIR / f'{IFACE}.conf'
 RELAYS_URL = 'https://api.mullvad.net/www/relays/wireguard/'
-PROBE_ADDRESS = '10.64.0.1'  # Mullvad's resolver inside every tunnel; it answers ping
+PROBE_ADDRESS = '10.64.0.1'  # Mullvad's resolver inside its tunnels (used only when a config names no DNS)
+PUBLIC_PROBES = ('1.1.1.1', '9.9.9.9')   # answer ping through any provider's tunnel
 WG = '/usr/bin/wg'
 WG_QUICK = '/usr/bin/wg-quick'
 SYSTEMCTL = '/usr/bin/systemctl'
@@ -191,13 +193,24 @@ def parse_conf(text: str) -> dict[str, Any]:
 def _valid_endpoint(value: str) -> tuple[str, int] | None:
     match = re.fullmatch(r'\[?([0-9a-fA-F:.]+)\]?:([0-9]{1,5})', value or '')
     if not match:
-        return None
+        # some providers name the server (vpn.example.com:51820): looked up once, at import
+        named = re.fullmatch(r'([A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+):([0-9]{1,5})', value or '')
+        if not named:
+            return None
+        try:
+            infos = socket.getaddrinfo(named.group(1), int(named.group(2)), socket.AF_INET, socket.SOCK_DGRAM)
+        except (OSError, ValueError):
+            return None
+        globals_ = [i[4][0] for i in infos if ipaddress.ip_address(i[4][0]).is_global]
+        if not globals_:
+            return None
+        match = re.fullmatch(r'(.+):([0-9]{1,5})', f'{globals_[0]}:{named.group(2)}')
     try:
         ip = ipaddress.ip_address(match.group(1))
     except ValueError:
         return None
     port = int(match.group(2))
-    if not 1 <= port <= 65535 or not ip.is_global:
+    if not 1 <= port <= 65535 or not ip.is_global:   # a public server only: a private one would loop
         return None
     return str(ip), port
 
@@ -234,6 +247,14 @@ def _live_conf() -> tuple[str, dict[str, Any]]:
     return text, parse_conf(text)
 
 
+def _psk_for(pubkey: str) -> str | None:
+    for entry in (_read_json(KEYS_PATH, {}) or {}).values():
+        psk = ((entry or {}).get('psk') or {}).get(pubkey) if isinstance(entry, dict) else None
+        if isinstance(psk, str) and _KEY.fullmatch(psk):
+            return psk
+    return None
+
+
 def _render_conf(live_text: str, private_key: str | None, address: str | None, peer: dict[str, Any]) -> str:
     """The live file with its [Peer] replaced; for another key, PrivateKey and Address too.
     Every other [Interface] line (PostUp, Table, DNS, comments) stays exactly as it was."""
@@ -242,9 +263,26 @@ def _render_conf(live_text: str, private_key: str | None, address: str | None, p
         head = re.sub(r'(?im)^(\s*PrivateKey\s*=\s*).*$', lambda m: m.group(1) + private_key, head, count=1)
     if address is not None:
         head = re.sub(r'(?im)^(\s*Address\s*=\s*).*$', lambda m: m.group(1) + address, head, count=1)
+    dns = [d for d in (peer.get('dns') or []) if isinstance(d, str)]
+    if dns:   # another provider's server: its own resolver, or names stop resolving inside its tunnel
+        if re.search(r'(?im)^\s*DNS\s*=', head):
+            head = re.sub(r'(?im)^(\s*DNS\s*=\s*).*$', lambda m: m.group(1) + ', '.join(dns), head, count=1)
+        else:
+            head = head.rstrip('\n') + f"\nDNS = {', '.join(dns)}\n"
     host = peer.get('hostname', 'server')
-    return (head + f"\n[Peer]\n# {host}\nPublicKey = {peer['pubkey']}\nAllowedIPs = 0.0.0.0/0, ::/0\n"
-            f"Endpoint = {peer['ipv4']}:{peer['port']}\n")
+    psk = _psk_for(peer['pubkey'])
+    return (head + f"\n[Peer]\n# {host}\nPublicKey = {peer['pubkey']}\n" + (f"PresharedKey = {psk}\n" if psk else '') +
+            f"AllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = {peer['ipv4']}:{peer['port']}\n")
+
+
+def first_conf(private_key: str, address: str) -> str:
+    """The tunnel's config on a board that had none: the same shape the switching keeps (its default
+    route only in table 200, which falls back to unreachable, so what is routed to it fails closed)."""
+    ipv4 = ','.join(a for a in address.split(',') if ':' not in a) or address
+    return (f"[Interface]\n# written by the Control Center: first tunnel on this board\nPrivateKey = {private_key}\n"
+            f"Address = {ipv4}\nTable = off\n"
+            "PostUp = ip -4 route replace default dev %i table 200; ip -4 route replace unreachable default metric 4096 table 200\n"
+            "PreDown = ip -4 route del default dev %i table 200\n")
 
 
 # ---------------------------------------------------------------- library
@@ -323,7 +361,8 @@ def refresh_relays() -> dict[str, Any]:
 
 
 def import_configs(data: bytes, filename: str) -> dict[str, Any]:
-    """Import Mullvad config files (.zip or .conf). Keys go to keys.json, servers to the library."""
+    """Import WireGuard config files from any provider (.zip or .conf). Keys go to keys.json, servers to
+    the library, with the DNS each config names."""
     if len(data) > MAX_UPLOAD_BYTES:
         raise VpnError('The file is larger than 2 MB.')
     files: list[tuple[str, str]] = []
@@ -368,13 +407,17 @@ def import_configs(data: bytes, filename: str) -> dict[str, Any]:
             pub_cache[private_key] = public_key_of(private_key)
         kid = key_id(pub_cache[private_key])
         keys.setdefault(kid, {'private_key': private_key, 'address': address, 'added': int(time.time())})
+        psk = peer.get('presharedkey', '')
+        if _KEY.fullmatch(psk):   # self-hosted servers and some providers add one: kept root-only with the keys
+            keys[kid].setdefault('psk', {})[peer['publickey']] = psk
         host = name[:-5]
         cc = _country_from_host(host)
         if not cc:
             host, cc = f'imported-{hashlib.sha256(peer["publickey"].encode()).hexdigest()[:8]}', 'xx'
         servers.append({'hostname': host, 'country_code': cc, 'country': cc.upper(), 'city': host[3:6].upper(),
                         'ipv4': endpoint[0], 'port': endpoint[1], 'pubkey': peer['publickey'],
-                        'active': True, 'source': 'upload', 'key_id': kid})
+                        'active': True, 'source': 'upload', 'key_id': kid,
+                        'dns': conf_dns(text)})   # the provider's resolver: DNS keeps working after a switch
     if not servers:
         raise VpnError(f'None of the {len(files)} files is a usable WireGuard config.')
     with _lock:
@@ -476,6 +519,7 @@ def library() -> dict[str, Any]:
         'rotation': state['rotation'], 'last_switch': state['last_switch'], 'history': state['history'][-10:],
         'exit': exit_info(), 'latency_at': state.get('latency_at'),
         'autopick': state['autopick'], 'autopick_at': state['autopick_at'] or None, 'second_server': second_server(),
+        'present': vpn_present(),
     }
 
 
@@ -503,22 +547,60 @@ def _apply(text: str, restart: bool) -> None:
         raise VpnError(f'wg syncconf failed: {out.strip()[:300]}')
 
 
+def conf_dns(text: str) -> list[str]:
+    """The IPv4 resolvers a WireGuard config names (its [Interface] DNS line): the provider's own."""
+    m = re.search(r'(?im)^\s*DNS\s*=\s*(.+)$', re.split(r'(?im)^\s*\[peer\]', text or '', maxsplit=1)[0])
+    out = []
+    for part in (m.group(1).split(',') if m else []):
+        try:
+            if ipaddress.ip_address(part.strip()).version == 4:
+                out.append(part.strip())
+        except ValueError:
+            continue   # a search domain, or IPv6
+    return out[:3]
+
+
+def probe_targets(iface: str | None = None) -> list[str]:
+    """What to ping through a tunnel to see it carries traffic: the provider's resolver from the config
+    (Mullvad's when none is named), then two public addresses. Any provider, not only Mullvad."""
+    try:
+        own = conf_dns(CONF_PATH.read_text(encoding='utf-8'))
+    except OSError:
+        own = []
+    return list(dict.fromkeys((own or [PROBE_ADDRESS]) + list(PUBLIC_PROBES)))
+
+
+def _ping_through(iface: str, count: int = 1, wait: int = 2) -> tuple[bool, str, str]:
+    """(answered, by whom, ping output) trying each probe target in turn."""
+    for target in probe_targets(iface):
+        code, out = _run([PING, '-n', '-c', str(count), '-W', str(wait), '-I', iface, target], timeout=count * wait + 4)
+        if code == 0:
+            return True, target, out
+    return False, '', ''
+
+
+def vpn_present() -> bool:
+    """A tunnel is set up on this board (its config exists). Without one everything runs direct and the
+    VPN features wait for an import; nothing requires a VPN."""
+    return CONF_PATH.is_file()
+
+
 def _verify(pubkey: str, since: float, timeout: float = 15, log: bool = True) -> bool:
     deadline = time.time() + timeout
     handshake_logged = False
     while time.time() < deadline:
-        _run([PING, '-n', '-c', '1', '-W', '2', '-I', IFACE, PROBE_ADDRESS], timeout=4)
+        _ping_through(IFACE)
         dump = _wg_dump()
         peer = next((p for p in dump.get('peers', []) if p['pubkey'] == pubkey), None)
         if peer and peer['handshake'] >= int(since) - 1:
             if log and not handshake_logged:
                 _log(f'Handshake done after {time.time() - since:.1f} s', 'ok')
                 handshake_logged = True
-            code, out = _run([PING, '-n', '-c', '2', '-W', '2', '-I', IFACE, PROBE_ADDRESS], timeout=6)
-            if code == 0:
+            ok, who, out = _ping_through(IFACE, count=2)
+            if ok:
                 if log:
                     rtt = re.search(r'= [0-9.]+/([0-9.]+)/', out)
-                    _log(f"Reply through the tunnel from {PROBE_ADDRESS}" + (f' in {float(rtt.group(1)):.0f} ms' if rtt else ''), 'ok')
+                    _log(f"Reply through the tunnel from {who}" + (f' in {float(rtt.group(1)):.0f} ms' if rtt else ''), 'ok')
                 return True
         time.sleep(1)
     return False
@@ -533,6 +615,13 @@ def switch(hostname: str, reason: str = 'manual') -> dict[str, Any]:
             raise VpnError(f'{hostname} is not in the server library.')
         place = ', '.join(p for p in (server.get('city'), server.get('country')) if p)
         _log(f'Switching to {hostname} ({place})')
+        first = not vpn_present()
+        if first:   # no tunnel yet: this server's key makes the first one
+            entry = (_read_json(KEYS_PATH, {}) or {}).get(server.get('key_id') or '')
+            if not entry:
+                raise VpnError('Import a WireGuard config (.zip or .conf) for this server first.')
+            _write_private(CONF_PATH, first_conf(entry['private_key'], entry['address']))
+            _run([SYSTEMCTL, 'enable', f'{UNIT}.service'], timeout=10)
         live_text, live = _live_conf()
         previous = (active().get('server') or {}).get('hostname') or 'the previous server'
         current_pub = _wg_dump().get('public_key', '')
@@ -559,6 +648,11 @@ def switch(hostname: str, reason: str = 'manual') -> dict[str, Any]:
         except VpnError as exc:
             _log(str(exc), 'error')
             ok = False
+        if not ok and first:   # the first server did not answer: back to no VPN at all, as before
+            _log(f'{hostname} did not answer within 15 s; the board stays without a VPN', 'error')
+            _run([SYSTEMCTL, 'disable', '--now', f'{UNIT}.service'], timeout=30)
+            CONF_PATH.unlink(missing_ok=True)
+            raise VpnError(f'{hostname} did not answer through a new tunnel within 15 s; nothing was changed.')
         if not ok:
             _log(f'{hostname} did not answer within 15 s', 'error')
             _log(f'Restoring {previous}…', 'warn')
@@ -667,7 +761,7 @@ def rotation_tick() -> dict[str, Any] | None:
 AUTO_HOURS = (1, 2, 3, 6, 12, 24)
 AUTO_FASTER = 0.75       # a working tunnel moves only for a server at least a quarter faster...
 AUTO_MIN_GAIN = 20.0     # ...and 20 ms faster: each move pauses the Wi-Fi for a few seconds
-AUTO_FAILS = 2           # checks in a row without an answer through a tunnel before it is moved
+AUTO_FAILS = 3           # checks in a row with no answer from any probe address before a tunnel is moved
 AVOID_SECONDS = 3600     # a server that gave no handshake is left alone for an hour
 YOUTUBE_AVOID = 24 * 3600   # a server YouTube asks to sign in from is left alone for a day (for HomeTube)
 HOMETUBE = 'http://127.0.0.1:8891/api/tv/'   # HomeTube, if installed: it uses the second tunnel
@@ -689,9 +783,12 @@ def set_autopick(enabled: Any, hours: Any) -> dict[str, Any]:
 
 
 def _tunnel_answers(iface: str) -> bool:
-    """A reply through the tunnel from Mullvad's own resolver: the tunnel really carries traffic."""
-    code, _out = _run([PING, '-n', '-c', '2', '-W', '3', '-I', iface, PROBE_ADDRESS], timeout=12)
-    return code == 0
+    """Any reply through the tunnel (the provider's resolver, 1.1.1.1 or 9.9.9.9): it carries traffic.
+    A miss is printed to the agent's log, so a move can be checked afterwards."""
+    ok, _who, _out = _ping_through(iface, count=2, wait=3)
+    if not ok:
+        print(f'[VPN] no answer through {iface} from {", ".join(probe_targets(iface))}', flush=True)
+    return ok
 
 
 def _second_enabled() -> bool:
@@ -747,8 +844,8 @@ def autopick_tick() -> dict[str, Any] | None:
     least a quarter and 20 ms faster turns up (re-measured every few hours); HomeTube's tunnel also when
     YouTube refuses lookups through it. The two tunnels never share a server."""
     state = _state()
-    if not state['autopick']['enabled']:
-        return None
+    if not state['autopick']['enabled'] or not vpn_present():
+        return None   # no tunnel on this board: nothing to keep fast
     main_ok = _tunnel_answers(IFACE)
     _auto_fails['main'] = 0 if main_ok else _auto_fails['main'] + 1
     # a second tunnel that is in use stays wanted while it is down (a failed move must not end the care
@@ -797,6 +894,8 @@ def _autopick(main_dead: bool, second_dead: bool, refused: bool, second_on: bool
                     continue
                 break
             try:
+                if main_dead and main_host:   # the server that stopped answering is left alone for a while
+                    _leave_alone('avoid', main_host, AVOID_SECONDS)
                 switch(host, 'auto: no answer' if main_dead else 'auto: faster')
                 main_host = host
                 _auto_fails['main'] = 0
@@ -920,7 +1019,7 @@ def second_up(hostname: str) -> dict[str, Any]:
     started = time.time()
     deadline = started + 15
     while time.time() < deadline:
-        _run([PING, '-n', '-c', '1', '-W', '2', '-I', SECOND_IFACE, PROBE_ADDRESS], timeout=4)
+        _ping_through(SECOND_IFACE)
         code, hs = _run([WG, 'show', SECOND_IFACE, 'latest-handshakes'], timeout=5)
         parts = hs.split()
         if code == 0 and len(parts) > 1 and parts[1].isdigit() and int(parts[1]) >= int(started) - 1:

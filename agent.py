@@ -871,6 +871,8 @@ def wireguard_status() -> dict[str, Any]:
         if len(bits) >= 3:
             rx, tx = parse_bytes(bits[-2]), parse_bytes(bits[-1])
     return {
+        # no tunnel set up is a normal way to run this board, not a fault
+        'configured': sbc_site.vpn_present(CFG),
         'active': active, 'interface': iface, 'unit': CFG['vpn_unit'], 'endpoint': endpoint,
         'handshake_age': handshake_age, 'rx_bytes': rx, 'tx_bytes': tx,
     }

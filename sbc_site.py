@@ -127,6 +127,18 @@ def _valid(key: str, value: str) -> bool:
     return bool(_LABEL.fullmatch(value))
 
 
+def vpn_present(site: dict[str, str] | None = None) -> bool:
+    """A tunnel is set up on this board (root can see its config). Nothing here requires one."""
+    s = site or load()
+    return Path(f"/etc/wireguard/{s['vpn_interface']}.conf").is_file()
+
+
+def through_vpn(site: dict[str, str] | None = None) -> list[str]:
+    """curl arguments for a fetch that should leave through the tunnel when there is one, else direct."""
+    s = site or load()
+    return ['--interface', s['vpn_interface']] if vpn_present(s) else []
+
+
 def load(path: Path | None = None) -> dict[str, str]:
     """The board's settings: config.json over the generic defaults, invalid values ignored."""
     cfg = dict(DEFAULTS)

@@ -118,8 +118,8 @@ def home() -> dict[str, Any]:
 def _fetch(url: str) -> bytes | None:
     """Through the VPN tunnel, so the feeds see the tunnel's address, not the household's."""
     try:
-        cp = subprocess.run([CURL, '-fsS', '--max-time', '40', '--max-filesize', str(MAX_FEED_BYTES), '--interface',
-                             SITE['vpn_interface'], '-A', sbc_site.USER_AGENT, url], capture_output=True, timeout=50)
+        cp = subprocess.run([CURL, '-fsS', '--max-time', '40', '--max-filesize', str(MAX_FEED_BYTES), *sbc_site.through_vpn(SITE),
+                             '-A', sbc_site.USER_AGENT, url], capture_output=True, timeout=50)
     except (OSError, subprocess.TimeoutExpired):
         return None
     return cp.stdout if cp.returncode == 0 and cp.stdout else None

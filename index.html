@@ -695,13 +695,14 @@ pre { max-height: 430px; margin: 0; padding: 12px; overflow: auto; border: 1px s
       </section>
 
       <section class="section" id="vpn">
-        <div class="pagehead"><div><h2>VPN servers</h2><p>Every server your __SBC_SITE_VPN_LABEL__ key can use, by country. Switching keeps both Wi-Fi networks on the tunnel; if a new server does not answer within 15 seconds, the previous one comes back by itself.</p></div><button class="btn" id="vpnRefreshBtn" type="button">↻ Refresh</button></div>
+        <div class="pagehead"><div><h2>VPN servers</h2><p>Every server your __SBC_SITE_VPN_LABEL__ configs can use, by country (a VPN is optional; import configs from any WireGuard provider to add one). Switching keeps both Wi-Fi networks on the tunnel; if a new server does not answer within 15 seconds, the previous one comes back by itself.</p></div><button class="btn" id="vpnRefreshBtn" type="button">↻ Refresh</button></div>
         <div class="grid metrics">
           <div class="card"><div class="metric-label">Exit location</div><div class="metric-value" id="vpnExitPlace">—</div><div class="metric-note" id="vpnExitNote">Checked through the tunnel</div></div>
           <div class="card"><div class="metric-label">Server</div><div class="metric-value mono vpn-small" id="vpnServerName">—</div><div class="metric-note" id="vpnServerNote">—</div></div>
           <div class="card"><div class="metric-label">Last handshake</div><div class="metric-value" id="vpnHandshakeAge">—</div><div class="metric-note" id="vpnTransferNote">—</div></div>
           <div class="card"><div class="metric-label">Server choice</div><div class="metric-value" id="vpnRotationState">—</div><div class="metric-note" id="vpnRotationNote">—</div></div>
         </div>
+        <div class="card hidden" id="vpnNone"><div class="cardhead"><div><h3>No VPN on this board</h3><p class="sub">Everything works without one: the Wi-Fi, DNS filtering (it then asks encrypted public resolvers directly) and HomeTube go out through your internet connection. To add a VPN, import the WireGuard config files from your provider below, a .zip of many servers or a single .conf, from Mullvad or any other WireGuard provider, then press Connect on a server. The first server that answers becomes the board's tunnel; if it does not answer, the board stays as it is.</p></div></div></div>
         <div class="card vpn-log-card hidden" id="vpnLogCard" aria-live="polite">
           <div class="cardhead"><div><h3>Connection log</h3><p class="sub" id="vpnLogTitle">—</p></div><span class="pill" id="vpnLogState">—</span></div>
           <div class="vpn-progress"><span id="vpnLogBar"></span></div>
@@ -744,9 +745,9 @@ pre { max-height: 430px; margin: 0; padding: 12px; overflow: auto; border: 1px s
         <div class="grid two" style="margin-top:12px">
           <div class="card">
             <div class="cardhead"><div><h3>Server list</h3><p class="sub" id="vpnListUpdated">—</p></div></div>
-            <div class="btnrow"><button class="btn" id="vpnListRefreshBtn" type="button">Update from Mullvad's list</button>
-              <label class="btn" for="vpnImportFile">Import Mullvad configs (.zip or .conf)</label><input id="vpnImportFile" type="file" accept=".zip,.conf" hidden></div>
-            <p class="footnote">The public list needs no account details: it holds server names, addresses and server keys. Imported config files may carry another key from your account; their servers then switch the tunnel to that key. Keys stay root-only on this server.</p>
+            <div class="btnrow"><button class="btn" id="vpnListRefreshBtn" type="button">Update Mullvad's public list</button>
+              <label class="btn" for="vpnImportFile">Import WireGuard configs (.zip or .conf)</label><input id="vpnImportFile" type="file" accept=".zip,.conf" hidden></div>
+            <p class="footnote">Import adds the servers in WireGuard config files from any provider (Mullvad, Proton, IVPN, your own server…): a .zip of many, or one .conf. Each keeps its own key and DNS, so switching to it just works. Mullvad users can also fetch Mullvad's public list (server names, addresses and server keys; no account details). Keys stay root-only on this server.</p>
           </div>
           <div class="card">
             <div class="cardhead"><div><h3>Recent switches</h3><p class="sub">Manual, random and rotation changes.</p></div></div>
@@ -1115,7 +1116,7 @@ async function refreshAll(){try{document.body.classList.add('loading');const r=a
 function renderStatus(s){
   $('welcomeLine').textContent=`${s.hostname} · ${s.os}`;$('sideHost').textContent=s.hostname;updateConsolePrompt();
   $('lastUpdated').textContent='Updated '+new Date(s.timestamp).toLocaleTimeString();$('sysUpdated').textContent=new Date(s.timestamp).toLocaleString();
-  const v=s.vpn||{};document.querySelectorAll('[data-unit^="wg-quick@"]').forEach(el=>{el.dataset.unit=v.unit||SITE.vpn_unit;});const logVpn=$('logVpnUnit');if(logVpn)logVpn.value=v.unit||SITE.vpn_unit;$('vpnMetric').textContent=v.active?'Connected':'Disconnected';$('vpnNote').textContent=v.active?'WireGuard interface is up':'Routed client traffic should be blocked';$('vpnBadge').className='pill '+(v.active?'ok':'bad');$('vpnBadge').textContent=v.active?'Tunnel active':'Tunnel down';$('vpnInterface').textContent=v.interface||SITE.vpn_interface;$('vpnEndpoint').textContent=v.endpoint||'No endpoint reported';$('vpnHandshake').textContent=v.handshake_age===null?'No handshake':fmtDuration(v.handshake_age)+' ago';$('vpnTransfer').textContent=`↓ ${fmtBytes(v.rx_bytes)}  /  ↑ ${fmtBytes(v.tx_bytes)}`;
+  const v=s.vpn||{};document.querySelectorAll('[data-unit^="wg-quick@"]').forEach(el=>{el.dataset.unit=v.unit||SITE.vpn_unit;});const logVpn=$('logVpnUnit');if(logVpn)logVpn.value=v.unit||SITE.vpn_unit;const noVpn=v.configured===false;$('vpnMetric').textContent=noVpn?'No VPN':v.active?'Connected':'Disconnected';$('vpnNote').textContent=noVpn?'Traffic goes out directly; import a WireGuard config to add one':v.active?'WireGuard interface is up':'Routed client traffic should be blocked';$('vpnBadge').className='pill '+(noVpn?'':v.active?'ok':'bad');$('vpnBadge').textContent=noVpn?'Not set up':v.active?'Tunnel active':'Tunnel down';$('vpnInterface').textContent=v.interface||SITE.vpn_interface;$('vpnEndpoint').textContent=v.endpoint||'No endpoint reported';$('vpnHandshake').textContent=v.handshake_age===null?'No handshake':fmtDuration(v.handshake_age)+' ago';$('vpnTransfer').textContent=`↓ ${fmtBytes(v.rx_bytes)}  /  ↑ ${fmtBytes(v.tx_bytes)}`;
   const aps=s.aps||[];const clients=aps.flatMap(a=>(a.clients||[]).map(c=>({...c,radio:a.label})));const active=clients.filter(x=>x.associated).length;$('clientsMetric').textContent=String(active);$('clientsNote').textContent=`${clients.length} known DHCP lease(s)`;$('clientCountBadge').textContent=`${clients.length} device(s)`;
   $('uptimeMetric').textContent=fmtDuration(s.uptime_seconds);$('uptimeNote').textContent='Since last boot';$('tempMetric').textContent=s.temperature_c===null?'N/A':`${s.temperature_c}°C`;
   const mem=s.memory||{},memPct=mem.total?Math.round(mem.used/mem.total*100):0;$('memoryText').textContent=`${fmtBytes(mem.used)} / ${fmtBytes(mem.total)} (${memPct}%)`;$('memoryBar').style.width=memPct+'%';const disk=s.disk||{},diskPct=disk.total?Math.round(disk.used/disk.total*100):0;$('diskText').textContent=`${fmtBytes(disk.used)} / ${fmtBytes(disk.total)} (${diskPct}%)`;$('diskBar').style.width=diskPct+'%';$('loadText').textContent=(s.load||[]).join(' · ')||'—';$('kernelText').textContent=s.kernel;$('cpuModelText').textContent=`${s.cpu_model||'—'} · ${s.cpu_cores||'—'} cores`;$('healthBadge').textContent='Online';
@@ -1595,7 +1596,8 @@ $('secondApply').addEventListener('click',event=>{const host=$('secondServer').v
 function renderVpn(){
   const d=vpnData;if(!d)return;
   const a=d.active||{},ex=d.exit,srv=a.server;
-  $('vpnExitPlace').textContent=ex?`${vpnFlag((srv&&srv.country_code)||'')} ${ex.city||ex.country||'—'}`:(a.up?'Checking…':'Tunnel down');
+  $('vpnNone').classList.toggle('hidden',d.present!==false);
+  $('vpnExitPlace').textContent=d.present===false?'No VPN':ex?`${vpnFlag((srv&&srv.country_code)||'')} ${ex.city||ex.country||'—'}`:(a.up?'Checking…':'Tunnel down');
   $('vpnExitNote').textContent=ex?`${ex.country} · ${ex.ip}${ex.via_mullvad?' · confirmed by Mullvad':''}`:'Exit not confirmed yet';
   $('vpnServerName').textContent=srv?srv.hostname:(a.endpoint||'—');
   $('vpnServerNote').textContent=srv?`${srv.city}, ${srv.country}`:'Not in the library yet: update the list';
