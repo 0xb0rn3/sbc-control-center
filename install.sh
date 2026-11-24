@@ -283,6 +283,27 @@ systemctl enable --now sbc-control-center-agent.service sbc-control-center-web.s
 # monthly IEEE vendor registry refresh (the unit is written by the program it runs)
 python3 "$APP_DIR/sbc_admin.py" oui install-units
 
+# HomeTube (github.com/0xb0rn3/hometube): YouTube for the TV, served by this board at /tv. Optional.
+#   INSTALL_HOMETUBE=yes|no answers the question in advance.
+INSTALL_HOMETUBE="${INSTALL_HOMETUBE:-}"
+if [[ -z "$INSTALL_HOMETUBE" && -t 0 ]]; then
+  read -r -p "Install HomeTube (YouTube for your TV, served by this board at /tv)? [y/N] " answer
+  [[ "${answer,,}" == "y" ]] && INSTALL_HOMETUBE=yes || INSTALL_HOMETUBE=no
+fi
+if [[ "${INSTALL_HOMETUBE,,}" == "yes" ]]; then
+  printf '\n[+] HomeTube...\n'
+  HT_SRC=$(mktemp -d)
+  curl -fsSL --retry 3 https://github.com/0xb0rn3/hometube/archive/refs/heads/main.tar.gz | tar -xz -C "$HT_SRC" --strip-components=1
+  HT_ARGS=(--bind 127.0.0.1 --port 8891)
+  # HomeTube's own traffic through the VPN tunnel when its table (200) is in place; it then checks
+  # before every request to YouTube that it leaves by the tunnel, and refuses otherwise
+  if ip -4 route show table 200 2>/dev/null | grep -q "dev $VPN_INTERFACE"; then
+    HT_ARGS+=(--route-table 200 --route-dev "$VPN_INTERFACE" --after "$VPN_UNIT.service")
+  fi
+  bash "$HT_SRC/install.sh" "${HT_ARGS[@]}"
+  rm -rf "$HT_SRC"
+fi
+
 AP_ADDR="$AP_IP"
 ETH_ADDR="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}' || true)"
 

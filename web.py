@@ -72,13 +72,14 @@ STATIC_TYPES = {'.js': 'text/javascript; charset=utf-8', '.css': 'text/css; char
                 '.woff2': 'font/woff2', '.svg': 'image/svg+xml'}
 STATIC_PATH = re.compile(r'/assets/(vendor|ui|wallpapers)/([A-Za-z0-9][A-Za-z0-9_.-]{0,120})')
 STANDBY_PATH = sbc_site.APP_DIR / 'standby.html'
-TV_PATH = sbc_site.APP_DIR / 'tv.html'
-TUBE_URL = 'http://127.0.0.1:8891'
+# HomeTube (github.com/0xb0rn3/hometube), the TV page: an optional service on this board, served here at /tv
+HOMETUBE_URL = os.environ.get('SBC_HOMETUBE_URL', 'http://127.0.0.1:8891')
+HOMETUBE_GET = ('search', 'video', 'channel', 'home', 'history', 'later', 'captions', 'account', 'feed', 'related', 'warm', 'playlist', 'config')
 _tube_hits: dict[str, list[float]] = {}
 _tube_lock = threading.Lock()
 
 
-def tube_allowed(ip: str, limit: int = 40, window: float = 60.0) -> bool:
+def tube_allowed(ip: str, limit: int = 120, window: float = 60.0) -> bool:
     """No sign-in on the TV page, so each address gets a bounded number of tube requests a minute."""
     now = time.time()
     with _tube_lock:
@@ -94,7 +95,7 @@ def tube_allowed(ip: str, limit: int = 40, window: float = 60.0) -> bool:
 
 
 def tube_request(path: str, body: bytes | None = None) -> tuple[int, bytes]:
-    req = urllib.request.Request(TUBE_URL + path, data=body, method='POST' if body is not None else 'GET',
+    req = urllib.request.Request(HOMETUBE_URL + path, data=body, method='POST' if body is not None else 'GET',
                                  headers={'Content-Type': 'application/json'})
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
@@ -103,7 +104,7 @@ def tube_request(path: str, body: bytes | None = None) -> tuple[int, bytes]:
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read(100_000)
     except Exception:
-        return 503, b'{"ok":false,"error":"The YouTube service is not running."}'
+        return 503, b'{"ok":false,"error":"HomeTube is not running on this board."}'
 WALLPAPER_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,120}\.(?:jpe?g|webp|png)')
 
 
@@ -679,27 +680,30 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def relay_tube(self, path: str) -> None:
-        """Stream a TV playlist or video segment from the tube service as it arrives (a 1080p segment
-        is several MB, so it is never held in memory whole)."""
+    def relay_hometube(self, path: str) -> None:
+        """Pass a HomeTube page, file, playlist or video segment through as it arrives (a 1080p segment
+        is several MB, so it is never held in memory whole). HomeTube's own security headers go with
+        it: a second content policy from the portal would combine with HomeTube's and block the page."""
         headers = {}
         rng = self.headers.get('Range', '')
         if re.fullmatch(r'bytes=\d{0,15}-\d{0,15}', rng):
             headers['Range'] = rng
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         try:
-            resp = opener.open(urllib.request.Request(TUBE_URL + path, headers=headers), timeout=40)
+            resp = opener.open(urllib.request.Request(HOMETUBE_URL + path, headers=headers), timeout=40)
         except urllib.error.HTTPError as exc:
             resp = exc
         except Exception:
-            self.send_json(503, {'ok': False, 'error': 'The YouTube service is not running.'})
+            self.send_json(503, {'ok': False, 'error': 'HomeTube is not running on this board.'})
             return
         with resp:
             self.send_response(resp.status)
-            for name in ('Content-Type', 'Content-Length', 'Content-Range', 'Accept-Ranges'):
+            for name in ('Content-Type', 'Content-Length', 'Content-Range', 'Accept-Ranges', 'Cache-Control', 'Content-Security-Policy',
+                         'X-Content-Type-Options', 'Referrer-Policy', 'X-Frame-Options', 'Cross-Origin-Resource-Policy'):
                 if resp.headers.get(name):
                     self.send_header(name, resp.headers[name])
-            self.security_headers()
+            if isinstance(self.connection, ssl.SSLSocket):
+                self.send_header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
             self.end_headers()
             try:
                 while chunk := resp.read(65536):
@@ -1138,39 +1142,24 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        if path == '/tv':
-            try:
-                body = TV_PATH.read_bytes()
-            except OSError:
-                self.send_error(404, 'TV page not installed')
-                return
-            for token, value in PAGE_TOKENS:
-                body = body.replace(token, value)
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/html; charset=utf-8')
-            self.send_header('Content-Length', str(len(body)))
-            self.security_headers(secrets.token_urlsafe(18), media=True)
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        if path in ('/api/tv/stream', '/api/tv/hls'):
-            # playback makes a request every few seconds: its own, larger allowance per address
-            if not tube_allowed('hls:' + client_ip(self), limit=1200):
+        if path == '/tv' or path.startswith('/assets/hometube/') or path in ('/api/tv/stream', '/api/tv/hls'):
+            # the page, its files and playback: playback asks every few seconds, so a larger allowance
+            if not tube_allowed('hls:' + client_ip(self), limit=1500):
                 self.send_json(429, {'ok': False, 'error': 'Too many requests; wait a minute.'})
                 return
-            self.relay_tube('/' + path[8:] + ('?' + parsed.query if parsed.query else ''))
+            self.relay_hometube(path + ('?' + parsed.query if parsed.query else ''))
             return
-        if path.startswith('/api/tv/') and path[8:] in ('search', 'video', 'channel', 'home', 'history', 'later', 'captions', 'account', 'feed', 'related', 'warm', 'playlist'):
+        if path == '/api/tv/status':
+            # which way HomeTube goes out and the address YouTube sees: for the administrator
+            if not self.require_session():
+                return
+            self.relay_hometube(path)
+            return
+        if path.startswith('/api/tv/') and path[8:] in HOMETUBE_GET:
             if not tube_allowed(client_ip(self)):
                 self.send_json(429, {'ok': False, 'error': 'Too many requests; wait a minute.'})
                 return
-            status, body = tube_request('/' + path[8:] + ('?' + parsed.query if parsed.query else ''))
-            self.send_response(status)
-            self.send_header('Content-Type', 'text/vtt; charset=utf-8' if path.endswith('/captions') and status == 200 else 'application/json')
-            self.send_header('Content-Length', str(len(body)))
-            self.security_headers()
-            self.end_headers()
-            self.wfile.write(body)
+            self.relay_hometube(path + ('?' + parsed.query if parsed.query else ''))
             return
         if path in ('/standby', '/living-room'):
             try:
@@ -1443,7 +1432,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_json(400, {'ok': False, 'error': str(exc)})
                 return
-            status, body = tube_request('/cookies', json.dumps({'text': str(data.get('text', ''))[:400_000], 'clear': bool(data.get('clear'))}).encode())
+            status, body = tube_request('/api/tv/cookies', json.dumps({'text': str(data.get('text', ''))[:400_000], 'clear': bool(data.get('clear'))}).encode())
             self.send_response(status)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(body)))
@@ -1460,8 +1449,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_json(400, {'ok': False, 'error': str(exc)})
                 return
-            keys = ('ua', 'w', 'h', 'dpr', 'sw', 'sh', 'names', 'mse', 'hlsNative', 'hlsjs', 'sw_api', 'codecs') if path.endswith('/diag') else ('id', 'name', 'add', 'item', 'remove', 'csv')
-            status, body = tube_request('/' + path[8:], json.dumps({k: data.get(k) for k in keys}).encode())
+            keys = ('id', 'name', 'add', 'item', 'remove', 'csv')
+            status, body = tube_request(path, json.dumps({k: data.get(k) for k in keys}).encode())
             self.send_response(status)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(body)))
