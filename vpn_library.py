@@ -32,6 +32,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -442,6 +443,16 @@ def _state() -> dict[str, Any]:
     state['history'] = [h for h in state.get('history', []) if isinstance(h, dict)][-HISTORY_LIMIT:]
     state['last_switch'] = state.get('last_switch') if isinstance(state.get('last_switch'), (int, float)) else None
     state['latency'] = state.get('latency') if isinstance(state.get('latency'), dict) else {}
+    auto = state.get('autopick') if isinstance(state.get('autopick'), dict) else {}
+    # on unless switched off: the household and HomeTube always on the fastest server that works
+    state['autopick'] = {'enabled': auto.get('enabled', True) is not False,
+                         'hours': auto.get('hours') if auto.get('hours') in AUTO_HOURS else 6}
+    for key in ('avoid', 'youtube_avoid'):
+        state[key] = {h: t for h, t in (state.get(key) or {}).items() if isinstance(h, str) and isinstance(t, (int, float))} \
+            if isinstance(state.get(key), dict) else {}
+    for key in ('autopick_at', 'second_switch_at'):
+        state[key] = state.get(key) if isinstance(state.get(key), (int, float)) else 0
+    state['second_wanted'] = bool(state.get('second_wanted'))
     return state
 
 
@@ -458,11 +469,13 @@ def library() -> dict[str, Any]:
                             {'latency_ms': state['latency'].get(s['hostname']), 'own_key': bool(s.get('key_id'))})
     return {
         'ok': True, 'interface': IFACE, 'unit': UNIT, 'active': active(),
-        'countries': sorted(countries.values(), key=lambda c: c['name']),
+        # fastest first: each country by its quickest server, unmeasured ones last by name
+        'countries': sorted(countries.values(), key=lambda c: (min((s['latency_ms'] for s in c['servers'] if isinstance(s['latency_ms'], (int, float))), default=1e9), c['name'])),
         'server_count': sum(len(c['servers']) for c in countries.values()),
         'updated': data.get('updated'), 'imported_keys': len(keys) if isinstance(keys, dict) else 0,
         'rotation': state['rotation'], 'last_switch': state['last_switch'], 'history': state['history'][-10:],
         'exit': exit_info(), 'latency_at': state.get('latency_at'),
+        'autopick': state['autopick'], 'autopick_at': state['autopick_at'] or None, 'second_server': second_server(),
     }
 
 
@@ -608,6 +621,8 @@ def set_rotation(enabled: Any, hours: Any, countries: Any) -> dict[str, Any]:
     with _lock:
         state = _state()
         state['rotation'] = {'enabled': enabled, 'hours': hours, 'countries': countries}
+        if enabled:   # random rotation and "always the fastest" would undo each other
+            state['autopick']['enabled'] = False
         if enabled and not state.get('last_switch'):
             state['last_switch'] = int(time.time())
         _write_json(STATE_PATH, state)
@@ -618,7 +633,7 @@ def set_rotation(enabled: Any, hours: Any, countries: Any) -> dict[str, Any]:
 def rotation_due(now: float | None = None) -> bool:
     state = _state()
     rotation = state['rotation']
-    if not rotation['enabled']:
+    if not rotation['enabled'] or state['autopick']['enabled']:
         return False
     last = state.get('last_switch') or 0
     return (now or time.time()) - last >= rotation['hours'] * 3600
@@ -645,6 +660,197 @@ def rotation_tick() -> dict[str, Any] | None:
         state['history'].append({'at': int(time.time()), 'hostname': None, 'reason': 'rotation failed', 'error': error[:200]})
         _write_json(STATE_PATH, state)
     return {'ok': False, 'error': error}
+
+
+# ---------------------------------------------------------------- always the fastest server
+
+AUTO_HOURS = (1, 2, 3, 6, 12, 24)
+AUTO_FASTER = 0.75       # a working tunnel moves only for a server at least a quarter faster...
+AUTO_MIN_GAIN = 20.0     # ...and 20 ms faster: each move pauses the Wi-Fi for a few seconds
+AUTO_FAILS = 2           # checks in a row without an answer through a tunnel before it is moved
+AVOID_SECONDS = 3600     # a server that gave no handshake is left alone for an hour
+YOUTUBE_AVOID = 24 * 3600   # a server YouTube asks to sign in from is left alone for a day (for HomeTube)
+HOMETUBE = 'http://127.0.0.1:8891/api/tv/'   # HomeTube, if installed: it uses the second tunnel
+_auto_fails = {'main': 0, 'second': 0}
+
+
+def set_autopick(enabled: Any, hours: Any) -> dict[str, Any]:
+    if not isinstance(enabled, bool) or hours not in AUTO_HOURS:
+        raise VpnError('"Always the fastest" needs on/off and one of the offered intervals.')
+    with _lock:
+        state = _state()
+        state['autopick'] = {'enabled': enabled, 'hours': hours}
+        if enabled:
+            state['rotation']['enabled'] = False   # the two would undo each other
+            state['autopick_at'] = 0                # look now, within a minute
+        _write_json(STATE_PATH, state)
+    return {'ok': True, 'message': (f'Always on the fastest server: checked every minute, re-measured every {hours} h.'
+                                    if enabled else '"Always the fastest" is off: the server stays where you put it.')}
+
+
+def _tunnel_answers(iface: str) -> bool:
+    """A reply through the tunnel from Mullvad's own resolver: the tunnel really carries traffic."""
+    code, _out = _run([PING, '-n', '-c', '2', '-W', '3', '-I', iface, PROBE_ADDRESS], timeout=12)
+    return code == 0
+
+
+def _second_enabled() -> bool:
+    _code, out = _run([SYSTEMCTL, 'is-enabled', f'wg-quick@{SECOND_IFACE}.service'], timeout=5)
+    return out.strip() == 'enabled'
+
+
+def second_server() -> str | None:
+    try:
+        m = re.search(r'second tunnel for per-device routing \(([a-z0-9-]{3,40})\)', SECOND_CONF.read_text())
+    except OSError:
+        return None
+    return m.group(1) if m else None
+
+
+def _hometube(path: str, timeout: float) -> dict[str, Any] | None:
+    try:
+        return json.loads(urllib.request.urlopen(HOMETUBE + path, timeout=timeout).read(100_000))
+    except Exception:   # not installed, or not running: nothing to check
+        return None
+
+
+def _ranked(exclude: set, youtube: bool = False) -> list[tuple[float, str]]:
+    """Measured servers, fastest first, without the ones to leave alone."""
+    state, now = _state(), time.time()
+    active_hosts = {s['hostname'] for s in _load_servers()['servers'] if s.get('active', True)}
+    avoid = {h for h, t in state['avoid'].items() if t > now}
+    if youtube:
+        avoid |= {h for h, t in state['youtube_avoid'].items() if t > now}
+    return sorted((ms, h) for h, ms in state['latency'].items()
+                  if isinstance(ms, (int, float)) and h in active_hosts and h not in exclude and h not in avoid)
+
+
+def _worth_moving(current_ms: Any, ranked: list[tuple[float, str]]) -> bool:
+    if not ranked or not isinstance(current_ms, (int, float)):
+        return False
+    best = ranked[0][0]
+    return best <= current_ms * AUTO_FASTER and current_ms - best >= AUTO_MIN_GAIN
+
+
+def _leave_alone(key: str, host: str | None, seconds: int) -> None:
+    if not host:
+        return
+    with _lock:
+        state = _state()
+        state[key][host] = int(time.time()) + seconds
+        _write_json(STATE_PATH, state)
+
+
+def autopick_tick() -> dict[str, Any] | None:
+    """Called about once a minute by the agent. Keeps both tunnels on the fastest servers that work: a
+    tunnel that stops answering moves at once (after two missed checks); a working one when a server at
+    least a quarter and 20 ms faster turns up (re-measured every few hours); HomeTube's tunnel also when
+    YouTube refuses lookups through it. The two tunnels never share a server."""
+    state = _state()
+    if not state['autopick']['enabled']:
+        return None
+    main_ok = _tunnel_answers(IFACE)
+    _auto_fails['main'] = 0 if main_ok else _auto_fails['main'] + 1
+    # a second tunnel that is in use stays wanted while it is down (a failed move must not end the care
+    # for it); only turning it off by hand (second_off) ends that
+    second_on = _second_enabled()
+    if second_on and not state['second_wanted']:
+        with _lock:
+            fresh = _state()
+            fresh['second_wanted'] = True
+            _write_json(STATE_PATH, fresh)
+    second_on = second_on or state['second_wanted']
+    second_ok = not second_on or _tunnel_answers(SECOND_IFACE)
+    _auto_fails['second'] = 0 if second_ok else _auto_fails['second'] + 1
+    ht = _hometube('status', 3) if second_on else None
+    refused = bool(ht and (ht.get('youtube_refused_at') or 0) > max(state['second_switch_at'], ht.get('lookup_ok_at') or 0))
+    main_dead = _auto_fails['main'] >= AUTO_FAILS
+    second_dead = second_on and _auto_fails['second'] >= AUTO_FAILS
+    due = time.time() - state['autopick_at'] >= state['autopick']['hours'] * 3600
+    if not (main_dead or second_dead or refused or due):
+        return None
+    try:
+        _begin_job('auto')
+    except VpnError:
+        return None   # a manual switch is running; look again next minute
+    return _job_body(_autopick, main_dead, second_dead, refused, second_on)
+
+
+def _autopick(main_dead: bool, second_dead: bool, refused: bool, second_on: bool) -> dict[str, Any]:
+    why = ('the tunnel stopped answering' if main_dead else 'HomeTube\'s tunnel stopped answering' if second_dead
+           else 'YouTube refuses lookups through HomeTube\'s tunnel' if refused else 'scheduled check')
+    _log(f'Always the fastest server: {why}')
+    try:
+        measure_latency()
+    except VpnError:
+        pass   # measured moments ago: use that
+    lat = _state()['latency']
+    main_host = (active().get('server') or {}).get('hostname')
+    second_host = second_server() if second_on else None
+    done = []
+    # the household tunnel
+    ranked = _ranked({second_host} if second_host else set())
+    if main_dead or _worth_moving(lat.get(main_host), ranked):
+        for ms, host in ranked[:4]:
+            if host == main_host:
+                if main_dead:
+                    continue
+                break
+            try:
+                switch(host, 'auto: no answer' if main_dead else 'auto: faster')
+                main_host = host
+                _auto_fails['main'] = 0
+                done.append(f'household tunnel on {host} ({round(ms)} ms)')
+                break
+            except VpnError as exc:
+                _log(f'{host}: {exc}', 'warn')
+                _leave_alone('avoid', host, AVOID_SECONDS)
+    else:
+        _log(f'Household tunnel: {main_host} is the fastest worth having ({round(lat.get(main_host) or 0)} ms)', 'ok')
+    # HomeTube's tunnel (and devices routed to it), on another server, one YouTube will answer from
+    if second_on:
+        if refused:
+            _log(f'YouTube refuses {second_host}: left alone for a day', 'warn')
+            _leave_alone('youtube_avoid', second_host, YOUTUBE_AVOID)
+        ranked2 = _ranked({main_host} if main_host else set(), youtube=True)
+        if second_dead or refused or second_host == main_host or _worth_moving(lat.get(second_host), ranked2):
+            moved = False
+            for ms, host in ranked2[:4]:
+                if host == second_host and not (second_dead or refused):
+                    break
+                try:
+                    second_up(host)
+                except VpnError as exc:
+                    _log(f'{host}: {exc}', 'warn')
+                    _leave_alone('avoid', host, AVOID_SECONDS)
+                    continue
+                with _lock:
+                    state = _state()
+                    state['second_switch_at'] = int(time.time())
+                    _write_json(STATE_PATH, state)
+                probe = _hometube('probe', 120)
+                if probe and probe.get('lookup') == 'refused':
+                    _log(f'YouTube refuses {host} too: trying the next', 'warn')
+                    _leave_alone('youtube_avoid', host, YOUTUBE_AVOID)
+                    continue
+                _auto_fails['second'] = 0
+                moved = True
+                done.append(f'HomeTube tunnel on {host} ({round(ms)} ms)' + (', YouTube answers' if probe and probe.get('lookup') == 'ok' else ''))
+                break
+            if not moved and second_host and not _tunnel_answers(SECOND_IFACE):
+                try:   # nothing better worked: at least the server it had
+                    second_up(second_host)
+                except VpnError as exc:
+                    _log(f'The second tunnel stays down: {exc}', 'error')
+        else:
+            _log(f'HomeTube tunnel: {second_host} is the fastest worth having ({round(lat.get(second_host) or 0)} ms)', 'ok')
+    with _lock:
+        state = _state()
+        state['autopick_at'] = int(time.time())
+        _write_json(STATE_PATH, state)
+    message = '; '.join(done) or 'Already on the fastest servers that work.'
+    _log(message, 'ok')
+    return {'ok': True, 'message': message}
 
 
 # ---------------------------------------------------------------- latency
@@ -724,6 +930,15 @@ def second_up(hostname: str) -> dict[str, Any]:
         time.sleep(1)
     second_down()
     raise VpnError(f'{hostname} gave no handshake on the second tunnel within 15 s; it was taken down.')
+
+
+def second_off() -> dict[str, Any]:
+    """Turned off by hand: the fastest-server picker stops looking after it too."""
+    with _lock:
+        state = _state()
+        state['second_wanted'] = False
+        _write_json(STATE_PATH, state)
+    return second_down()
 
 
 def second_down() -> dict[str, Any]:

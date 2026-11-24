@@ -127,7 +127,7 @@ PRIVILEGED_ACTIONS = {
     'terminal_start', 'service', 'update_job', 'wifi_config', 'backup_create', 'reboot', 'poweroff',
     'portal_update_source', 'logs', 'backup_download', 'dns_profile', 'packet_start', 'device_label', 'device_unlabel',
     'device_scan', 'device_fingerprint', 'packet_analysis',
-    'vpn_switch', 'vpn_random', 'vpn_rotation', 'vpn_import', 'devroute_set', 'vpn_second',
+    'vpn_switch', 'vpn_random', 'vpn_rotation', 'vpn_import', 'devroute_set', 'vpn_second', 'vpn_autopick',
 }
 
 
@@ -220,6 +220,11 @@ def privilege_scope(intent: Any) -> dict[str, Any] | None:
                 return None
             scope.update({'enabled': enabled, 'hours': hours})
         return scope
+    if action == 'vpn_autopick':
+        enabled, hours = intent.get('enabled'), intent.get('hours')
+        if not isinstance(enabled, bool) or hours not in vpn_library.AUTO_HOURS:
+            return None
+        return {'action': action, 'enabled': enabled, 'hours': hours}
     if action == 'packet_start':
         return _valid_packet_capture_scope(intent)
     if action == 'packet_analysis':
@@ -1388,6 +1393,8 @@ def vpn_action(action: str, req: dict[str, Any]) -> dict[str, Any]:
             return vpn_library.start_switch_job('random', vpn_library.switch_random, req.get('countries') or None)
         if action == 'vpn_rotation':
             return vpn_library.set_rotation(req.get('enabled'), req.get('hours'), req.get('countries', []))
+        if action == 'vpn_autopick':
+            return vpn_library.set_autopick(req.get('enabled'), req.get('hours'))
         if action == 'vpn_import':
             filename = req.get('filename') if isinstance(req.get('filename'), str) else 'upload.conf'
             return vpn_library.import_configs(_read_vpn_upload(req.get('upload')), filename[:120])
@@ -1417,6 +1424,12 @@ def vpn_rotation_scheduler() -> None:
                 print(f"[VPN] rotation: {result.get('message') or result.get('error')}", flush=True)
         except Exception as exc:
             print(f'[VPN] rotation check failed: {exc}', flush=True)
+        try:   # always the fastest server that works (the household tunnel and HomeTube's)
+            result = vpn_library.autopick_tick()
+            if result is not None:
+                print(f"[VPN] fastest: {result.get('message') or result.get('error')}", flush=True)
+        except Exception as exc:
+            print(f'[VPN] fastest-server check failed: {exc}', flush=True)
         time.sleep(60)
 
 
@@ -1447,7 +1460,7 @@ def do_action(req: dict[str, Any], trusted_root_peer: bool = False) -> dict[str,
     if action == 'vpn_second':
         try:
             host = req.get('hostname') or ''
-            result = vpn_library.second_up(host) if host else vpn_library.second_down()
+            result = vpn_library.second_up(host) if host else vpn_library.second_off()
             state = devroute.load_state(); state['second_server'] = host or None; devroute.save_state(state)
             return result
         except (vpn_library.VpnError, OSError) as exc:
@@ -1462,7 +1475,7 @@ def do_action(req: dict[str, Any], trusted_root_peer: bool = False) -> dict[str,
             return packet_history.status()
         except Exception as exc:
             return {'ok': False, 'error': f'Packet history unavailable: {exc}'}
-    if action in {'vpn_library', 'vpn_job', 'vpn_refresh', 'vpn_latency', 'vpn_switch', 'vpn_random', 'vpn_rotation', 'vpn_import'}:
+    if action in {'vpn_library', 'vpn_job', 'vpn_refresh', 'vpn_latency', 'vpn_switch', 'vpn_random', 'vpn_rotation', 'vpn_import', 'vpn_autopick'}:
         return vpn_action(action, req)
     if action == 'terminal_start':
         owner = req.get('session_id')

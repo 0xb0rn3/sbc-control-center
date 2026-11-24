@@ -1830,7 +1830,7 @@ class Handler(BaseHTTPRequestHandler):
                 payload = {'action': 'device_fingerprint', 'ip': data.get('ip')}
             elif action == 'moodboard_refresh':
                 payload = {'action': action}
-            elif action in {'vpn_refresh', 'vpn_latency', 'vpn_switch', 'vpn_random', 'vpn_rotation', 'devroute_set', 'vpn_second'}:
+            elif action in {'vpn_refresh', 'vpn_latency', 'vpn_switch', 'vpn_random', 'vpn_rotation', 'devroute_set', 'vpn_second', 'vpn_autopick'}:
                 payload = {'action': action}
                 for key in ('country', 'hostname', 'countries', 'enabled', 'hours', 'mac', 'route', 'label'):
                     if key in data:

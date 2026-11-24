@@ -181,3 +181,141 @@ class VpnLibraryTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class AlwaysFastestTests(unittest.TestCase):
+    """The fastest-server picker: what it moves, where to, and what it leaves alone."""
+    SERVERS = [('za-jnb-wg-001', 'za', 100.0), ('za-jnb-wg-002', 'za', 110.0), ('ng-los-wg-001', 'ng', 140.0),
+               ('us-hou-wg-001', 'us', 270.0), ('es-mad-wg-205', 'es', 190.0)]
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        (self.tmp / 'vpn').mkdir()
+        self.patchers = [mock.patch.object(vl, k, v) for k, v in {
+            'LIB_DIR': self.tmp / 'vpn', 'SERVERS_PATH': self.tmp / 'vpn/servers.json', 'KEYS_PATH': self.tmp / 'vpn/keys.json',
+            'STATE_PATH': self.tmp / 'vpn/state.json', 'SECOND_CONF': self.tmp / 'wg02.conf'}.items()]
+        for p in self.patchers:
+            p.start()
+        (self.tmp / 'vpn/servers.json').write_text(json.dumps({'servers': [
+            {'hostname': h, 'country_code': cc, 'country': cc, 'city': cc, 'ipv4': '192.0.2.1', 'port': 51820, 'pubkey': 'k', 'active': True}
+            for h, cc, _ms in self.SERVERS]}))
+        state = vl._state()
+        state['latency'] = {h: ms for h, _cc, ms in self.SERVERS}
+        vl._write_json(vl.STATE_PATH, state)
+        vl._auto_fails.update(main=0, second=0)
+        vl._job.update(state='idle')
+        self.main = 'us-hou-wg-001'
+        self.second = 'za-jnb-wg-001'
+        self.alive = {vl.IFACE: True, vl.SECOND_IFACE: True}
+        self.ht = {'status': {'youtube_refused_at': None, 'lookup_ok_at': None}, 'probe': {'lookup': 'ok'}}
+        self.switched, self.seconds = [], []
+        self.fakes = [
+            mock.patch.object(vl, '_tunnel_answers', side_effect=lambda iface: self.alive[iface]),
+            mock.patch.object(vl, '_second_enabled', return_value=True),
+            mock.patch.object(vl, 'measure_latency', return_value={'ok': True}),
+            mock.patch.object(vl, 'active', side_effect=lambda: {'server': {'hostname': self.main}}),
+            mock.patch.object(vl, 'second_server', side_effect=lambda: self.second),
+            mock.patch.object(vl, 'switch', side_effect=self.fake_switch),
+            mock.patch.object(vl, 'second_up', side_effect=self.fake_second_up),
+            mock.patch.object(vl, '_hometube', side_effect=lambda path, timeout: self.ht.get(path)),
+        ]
+        for f in self.fakes:
+            f.start()
+
+    def tearDown(self):
+        for f in self.fakes + self.patchers:
+            f.stop()
+        shutil.rmtree(self.tmp)
+
+    def fake_switch(self, host, reason='manual'):
+        if host in getattr(self, 'dead', ()):
+            raise vl.VpnError(f'{host} did not answer')
+        self.switched.append((host, reason)); self.main = host
+        self.alive[vl.IFACE] = True
+        return {'ok': True}
+
+    def fake_second_up(self, host):
+        if host in getattr(self, 'dead', ()):
+            raise vl.VpnError(f'{host} gave no handshake')
+        self.seconds.append(host); self.second = host
+        self.alive[vl.SECOND_IFACE] = True
+        self.ht['probe'] = self.probes.pop(0) if getattr(self, 'probes', None) else {'lookup': 'ok'}
+        return {'ok': True}
+
+    def checked(self):
+        state = vl._state(); state['autopick_at'] = int(time.time()); vl._write_json(vl.STATE_PATH, state)
+
+    def test_on_by_default(self):
+        self.assertTrue(vl._state()['autopick']['enabled'])
+
+    def test_quiet_when_both_tunnels_answer_and_nothing_is_due(self):
+        self.checked()
+        self.assertIsNone(vl.autopick_tick())
+        self.assertEqual((self.switched, self.seconds), ([], []))
+
+    def test_a_dead_household_tunnel_moves_to_the_fastest_other_than_hometubes(self):
+        self.checked()
+        self.alive[vl.IFACE] = False
+        self.assertIsNone(vl.autopick_tick())                      # one missed check: not yet
+        result = vl.autopick_tick()                                # two in a row: move
+        self.assertTrue(result['ok'])
+        self.assertEqual(self.switched, [('za-jnb-wg-002', 'auto: no answer')])   # -001 is HomeTube's
+        self.assertEqual(self.seconds, [])
+
+    def test_a_server_that_fails_is_skipped_and_left_alone(self):
+        self.checked()
+        self.alive[vl.IFACE] = False
+        self.dead = {'za-jnb-wg-002'}
+        vl.autopick_tick(); vl.autopick_tick()
+        self.assertEqual(self.switched, [('ng-los-wg-001', 'auto: no answer')])
+        self.assertIn('za-jnb-wg-002', vl._state()['avoid'])
+
+    def test_youtube_refusing_moves_hometubes_tunnel_and_waits_for_youtube_to_answer(self):
+        self.checked()
+        self.main = 'za-jnb-wg-002'
+        self.ht['status'] = {'youtube_refused_at': int(time.time()), 'lookup_ok_at': None}
+        self.probes = [{'lookup': 'refused'}, {'lookup': 'ok'}]
+        result = vl.autopick_tick()
+        self.assertEqual(self.seconds, ['ng-los-wg-001', 'es-mad-wg-205'])   # -001 refused before, ng refused on probe
+        avoid = vl._state()['youtube_avoid']
+        self.assertIn('za-jnb-wg-001', avoid); self.assertIn('ng-los-wg-001', avoid)
+        self.assertIn('es-mad-wg-205', result['message'])
+        self.assertEqual(self.switched, [])                        # the household tunnel was fine
+
+    def test_a_working_tunnel_moves_only_for_a_clear_gain(self):
+        self.main = 'za-jnb-wg-002'                                # 110 ms; -001 (100) is HomeTube's anyway
+        vl.autopick_tick()                                         # due (never measured): checks, moves nothing
+        self.assertEqual((self.switched, self.seconds), ([], []))
+        self.main = 'us-hou-wg-001'                                # 270 ms: 110 is far better
+        state = vl._state(); state['autopick_at'] = 0; vl._write_json(vl.STATE_PATH, state)
+        vl.autopick_tick()
+        self.assertEqual(self.switched, [('za-jnb-wg-002', 'auto: faster')])
+
+    def test_the_two_tunnels_never_share_a_server(self):
+        self.main = self.second = 'za-jnb-wg-001'
+        vl.autopick_tick()
+        self.assertNotEqual(self.main, self.second)
+
+    def test_rotation_and_fastest_exclude_each_other(self):
+        vl.set_rotation(True, 6, [])
+        self.assertFalse(vl._state()['autopick']['enabled'])
+        self.assertIsNone(vl.autopick_tick())
+        vl.set_autopick(True, 6)
+        state = vl._state()
+        self.assertTrue(state['autopick']['enabled']); self.assertFalse(state['rotation']['enabled'])
+        self.assertFalse(vl.rotation_due(time.time() + 10**6))
+        with self.assertRaises(vl.VpnError):
+            vl.set_autopick(True, 5)
+
+    def test_turning_the_second_tunnel_off_by_hand_ends_the_care_for_it(self):
+        self.checked()
+        vl.autopick_tick()
+        self.assertTrue(vl._state()['second_wanted'])
+        with mock.patch.object(vl, '_run', return_value=(0, '')):
+            vl.second_off()
+        self.assertFalse(vl._state()['second_wanted'])
+
+    def test_the_list_puts_the_fastest_countries_first(self):
+        with mock.patch.object(vl, 'exit_info', return_value=None):
+            codes = [c['code'] for c in vl.library()['countries']]
+        self.assertEqual(codes, ['za', 'ng', 'es', 'us'])

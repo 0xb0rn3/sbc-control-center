@@ -700,7 +700,7 @@ pre { max-height: 430px; margin: 0; padding: 12px; overflow: auto; border: 1px s
           <div class="card"><div class="metric-label">Exit location</div><div class="metric-value" id="vpnExitPlace">—</div><div class="metric-note" id="vpnExitNote">Checked through the tunnel</div></div>
           <div class="card"><div class="metric-label">Server</div><div class="metric-value mono vpn-small" id="vpnServerName">—</div><div class="metric-note" id="vpnServerNote">—</div></div>
           <div class="card"><div class="metric-label">Last handshake</div><div class="metric-value" id="vpnHandshakeAge">—</div><div class="metric-note" id="vpnTransferNote">—</div></div>
-          <div class="card"><div class="metric-label">Rotation</div><div class="metric-value" id="vpnRotationState">Off</div><div class="metric-note" id="vpnRotationNote">Manual switching</div></div>
+          <div class="card"><div class="metric-label">Server choice</div><div class="metric-value" id="vpnRotationState">—</div><div class="metric-note" id="vpnRotationNote">—</div></div>
         </div>
         <div class="card vpn-log-card hidden" id="vpnLogCard" aria-live="polite">
           <div class="cardhead"><div><h3>Connection log</h3><p class="sub" id="vpnLogTitle">—</p></div><span class="pill" id="vpnLogState">—</span></div>
@@ -718,7 +718,14 @@ pre { max-height: 430px; margin: 0; padding: 12px; overflow: auto; border: 1px s
             <p class="footnote" id="vpnFastest">Measure latency to see the quickest servers.</p>
           </div>
           <div class="card">
-            <div class="cardhead"><div><h3>Automatic rotation</h3><p class="sub">Every few hours the server switches to a random one from the countries you tick (all countries when none is ticked).</p></div></div>
+            <div class="cardhead"><div><h3>Always the fastest server</h3><p class="sub">Every minute this server checks that both tunnels answer. One that stops answering moves at once to the fastest server that works. A working one moves when a server at least a quarter (and 20 ms) faster turns up, measured every few hours, so the Wi-Fi is not paused for small gains. HomeTube's tunnel also moves when YouTube refuses to answer through it, and a new server only counts once YouTube answers. The two tunnels never share a server.</p></div></div>
+            <div class="vpn-rotation-row"><label class="vpn-switch"><input type="checkbox" id="vpnAutoEnabled"> Always the fastest</label>
+              <label class="vpn-every">re-measure every <select id="vpnAutoHours" class="select"></select></label></div>
+            <p class="footnote" id="vpnAutoNote" style="margin:4px 0 0">—</p>
+            <div class="btnrow" style="margin-top:12px"><button class="btn primary" id="vpnAutoSave" type="button">Save</button><span class="footnote" id="vpnAutoResult" style="margin:0"></span></div>
+          </div>
+          <div class="card">
+            <div class="cardhead"><div><h3>Automatic rotation</h3><p class="sub">Every few hours the server switches to a random one from the countries you tick (all countries when none is ticked). Turning it on turns "Always the fastest" off, and the other way round.</p></div></div>
             <div class="vpn-rotation-row"><label class="vpn-switch"><input type="checkbox" id="vpnRotationEnabled"> Rotate automatically</label>
               <label class="vpn-every">every <select id="vpnRotationHours" class="select"></select></label></div>
             <div class="vpn-country-picks" id="vpnRotationCountries" aria-label="Countries to rotate through"></div>
@@ -1190,7 +1197,7 @@ $('privilegeCancelBtn').addEventListener('click',()=>closePrivilegeDialog(null))
 $('privilegeDialog').addEventListener('cancel',event=>{event.preventDefault();closePrivilegeDialog(null);});
 $('privilegeDialog').addEventListener('close',()=>{if(privilegeResolver)closePrivilegeDialog(null);});
 async function executeAdminAction(data,summary='This operation needs administrator privileges.'){
-  const privilegeRequired=['devroute_set','vpn_second','vpn_switch','vpn_random','vpn_rotation','service','update_job','wifi_config','backup_create','reboot','poweroff','portal_update_source','logs','backup_download','dns_profile','packet_start','packet_analysis','device_label','device_unlabel','device_scan','device_fingerprint'].includes(data.action)
+  const privilegeRequired=['devroute_set','vpn_second','vpn_switch','vpn_random','vpn_rotation','vpn_autopick','service','update_job','wifi_config','backup_create','reboot','poweroff','portal_update_source','logs','backup_download','dns_profile','packet_start','packet_analysis','device_label','device_unlabel','device_scan','device_fingerprint'].includes(data.action)
     || (data.action==='console'&&(['status','nft','journalctl','wg'].includes(String(data.command||'').trim().split(/\s+/)[0])||String(data.command||'').trim()==='ss -lntup'||/^systemctl\s+status\s+/.test(String(data.command||'').trim())||/^dns\s+profile\s+(standard|aggressive|tv)$/.test(String(data.command||'').trim())));
   if(!privilegeRequired)return api('/api/action',{method:'POST',body:JSON.stringify(data)});
   if(!configuredSudoUser)throw new Error('No sudo account is configured on the server. Re-run installation with SUDO_AUTH_USER set.');
@@ -1594,14 +1601,18 @@ function renderVpn(){
   $('vpnServerNote').textContent=srv?`${srv.city}, ${srv.country}`:'Not in the library yet: update the list';
   $('vpnHandshakeAge').textContent=a.handshake?vpnAgo(a.handshake):'none yet';
   $('vpnTransferNote').textContent=`↓ ${fmtBytes(a.rx||0)} · ↑ ${fmtBytes(a.tx||0)}`;
-  const r=d.rotation||{};
-  $('vpnRotationState').textContent=r.enabled?`Every ${r.hours} h`:'Off';
-  $('vpnRotationNote').textContent=r.enabled?`${(r.countries||[]).length?r.countries.map(c=>c.toUpperCase()).join(', '):'All countries'} · last switch ${vpnAgo(d.last_switch)}`:'Manual switching';
+  const r=d.rotation||{},ap=d.autopick||{};
+  $('vpnRotationState').textContent=ap.enabled?'Fastest':r.enabled?`Random every ${r.hours} h`:'Manual';
+  $('vpnRotationNote').textContent=ap.enabled?`checked every minute · measured ${d.autopick_at?vpnAgo(d.autopick_at):'soon'}`:r.enabled?`${(r.countries||[]).length?r.countries.map(c=>c.toUpperCase()).join(', '):'All countries'} · last switch ${vpnAgo(d.last_switch)}`:'The server stays where you put it';
+  const ah=$('vpnAutoHours');if(!ah.options.length)ah.innerHTML=[1,2,3,6,12,24].map(h=>`<option value="${h}">${h} h</option>`).join('');
+  ah.value=String(ap.hours||6);$('vpnAutoEnabled').checked=!!ap.enabled;
+  const lat=h=>{for(const c of d.countries){const s=c.servers.find(x=>x.hostname===h);if(s)return s.latency_ms!=null?` (${Math.round(s.latency_ms)} ms)`:'';}return '';};
+  $('vpnAutoNote').textContent=`Household tunnel: ${(srv&&srv.hostname)||'—'}${srv?lat(srv.hostname):''}`+(d.second_server?` · HomeTube and per-device routes: ${d.second_server}${lat(d.second_server)}`:'');
   $('vpnServerCount').textContent=`${d.server_count} servers · ${d.countries.length} countries`;
   $('vpnListUpdated').textContent=d.updated?`${d.server_count} servers, updated ${vpnAgo(d.updated)}${d.imported_keys?` · ${d.imported_keys} imported key(s)`:''}`:'No servers yet: update from Mullvad\'s list.';
-  const sel=$('vpnCountry'),keep=sel.value||(srv&&srv.country_code)||'';
-  sel.innerHTML=d.countries.map(c=>{const best=Math.min(...c.servers.map(s=>s.latency_ms??Infinity));return `<option value="${vpnEsc(c.code)}">${vpnFlag(c.code)} ${vpnEsc(c.name)} · ${c.servers.length}${Number.isFinite(best)?` · ${Math.round(best)} ms`:''}</option>`;}).join('');
-  if(keep&&d.countries.some(c=>c.code===keep))sel.value=keep;
+  const sel=$('vpnCountry'),keep=sel.value||'*';
+  sel.innerHTML='<option value="*">All countries · fastest first</option>'+d.countries.map(c=>{const best=Math.min(...c.servers.map(s=>s.latency_ms??Infinity));return `<option value="${vpnEsc(c.code)}">${vpnFlag(c.code)} ${vpnEsc(c.name)} · ${c.servers.length}${Number.isFinite(best)?` · ${Math.round(best)} ms`:''}</option>`;}).join('');
+  sel.value=keep==='*'||d.countries.some(c=>c.code===keep)?keep:'*';
   renderVpnServers();
   const hours=$('vpnRotationHours');if(!hours.options.length)hours.innerHTML=[1,2,3,4,6,8,12,24].map(h=>`<option value="${h}">${h} h</option>`).join('');
   hours.value=String(r.hours||6);$('vpnRotationEnabled').checked=!!r.enabled;
@@ -1610,10 +1621,12 @@ function renderVpn(){
   $('vpnHistoryRows').innerHTML=(d.history||[]).slice().reverse().map(h=>`<tr><td>${vpnAgo(h.at)}</td><td class="mono">${vpnEsc(h.hostname||'—')}</td><td>${vpnEsc([h.city,h.country].filter(Boolean).join(', ')||h.error||'')}</td><td>${vpnEsc(h.reason||'')}</td></tr>`).join('')||'<tr><td colspan="4">No switches yet.</td></tr>';
 }
 function renderVpnServers(){
-  const d=vpnData;if(!d)return;const cc=$('vpnCountry').value;const c=d.countries.find(x=>x.code===cc);
+  const d=vpnData;if(!d)return;const cc=$('vpnCountry').value,all=cc==='*';const c=d.countries.find(x=>x.code===cc);
   const current=((d.active||{}).server||{}).hostname;
-  const rows=(c?c.servers:[]).slice().sort((x,y)=>(x.latency_ms??1e9)-(y.latency_ms??1e9)||x.hostname.localeCompare(y.hostname));
-  $('vpnServerRows').innerHTML=rows.map(s=>`<tr class="${s.hostname===current?'current':''}"><td class="mono">${vpnEsc(s.hostname)}</td><td>${vpnEsc(s.city)}</td><td>${s.owned?'Mullvad-owned':vpnEsc(s.provider||'rented')}</td><td>${s.latency_ms!=null?`${Math.round(s.latency_ms)} ms`:'—'}</td><td>${s.hostname===current?'<span class="pill ok">Connected</span>':`<button class="btn small" type="button" data-vpn-connect="${vpnEsc(s.hostname)}">Connect</button>`}</td></tr>`).join('')||'<tr><td colspan="5">No servers in this country.</td></tr>';
+  // fastest to slowest; servers not measured yet go last
+  const pool=all?d.countries.flatMap(x=>x.servers.map(s=>({...s,cc:x.code}))):(c?c.servers:[]);
+  const rows=pool.slice().sort((x,y)=>(x.latency_ms??1e9)-(y.latency_ms??1e9)||x.hostname.localeCompare(y.hostname)).slice(0,all?80:undefined);
+  $('vpnServerRows').innerHTML=rows.map(s=>`<tr class="${s.hostname===current?'current':''}"><td class="mono">${vpnEsc(s.hostname)}</td><td>${all?vpnFlag(s.cc)+' ':''}${vpnEsc(s.city)}</td><td>${s.owned?'Mullvad-owned':vpnEsc(s.provider||'rented')}</td><td>${s.latency_ms!=null?`${Math.round(s.latency_ms)} ms`:'—'}</td><td>${s.hostname===current?'<span class="pill ok">Connected</span>':`<button class="btn small" type="button" data-vpn-connect="${vpnEsc(s.hostname)}">Connect</button>`}</td></tr>`).join('')||'<tr><td colspan="5">No servers in this country.</td></tr>';
 }
 // The live connection log: a switch runs on the server and reports each step as it happens
 let vpnJobTimer=null;
@@ -1631,7 +1644,7 @@ function renderVpnJob(job){
   state.className='pill '+(running?'warn':job.state==='done'?'ok':'bad');
   state.textContent=running?'Connecting…':job.state==='done'?'Connected':'Not switched';
   const when=new Date((job.started||0)*1000).toLocaleTimeString();
-  $('vpnLogTitle').textContent=`${job.kind==='rotation'?'Scheduled rotation':job.kind==='random'?'Random server':'Manual switch'} · started ${when}${job.finished?` · ${(job.finished-job.started).toFixed(1)} s`:''}`;
+  $('vpnLogTitle').textContent=`${job.kind==='auto'?'Always the fastest':job.kind==='rotation'?'Scheduled rotation':job.kind==='random'?'Random server':'Manual switch'} · started ${when}${job.finished?` · ${(job.finished-job.started).toFixed(1)} s`:''}`;
 }
 async function followVpnJob(){
   clearTimeout(vpnJobTimer);
@@ -1653,14 +1666,16 @@ $('vpnRefreshBtn').addEventListener('click',()=>refreshVpn());
 $('vpnCountry').addEventListener('change',renderVpnServers);
 $('vpnServerRows').addEventListener('click',event=>{const b=event.target.closest('[data-vpn-connect]');if(!b)return;const host=b.dataset.vpnConnect;
   vpnRun({action:'vpn_switch',hostname:host},`Switch the VPN to ${host}. Wi-Fi clients pause for a few seconds; if the server does not answer, the current one comes back.`,b);});
-$('vpnRandomBtn').addEventListener('click',event=>{const cc=$('vpnCountry').value;vpnRun({action:'vpn_random',countries:cc?[cc]:[]},'Switch the VPN to a random server in the chosen country.',event.currentTarget);});
+$('vpnRandomBtn').addEventListener('click',event=>{const cc=$('vpnCountry').value;vpnRun({action:'vpn_random',countries:cc&&cc!=='*'?[cc]:[]},'Switch the VPN to a random server in the chosen country.',event.currentTarget);});
 $('vpnLatencyBtn').addEventListener('click',async event=>{const b=event.currentTarget;b.disabled=true;b.textContent='Measuring…';
-  try{const r=await api('/api/action',{method:'POST',body:JSON.stringify({action:'vpn_latency',country:$('vpnCountry').value})});
+  try{const cc=$('vpnCountry').value;const r=await api('/api/action',{method:'POST',body:JSON.stringify(cc&&cc!=='*'?{action:'vpn_latency',country:cc}:{action:'vpn_latency'})});
     if(r.ok===false)throw new Error(r.error);$('vpnFastest').textContent=r.fastest&&r.fastest.length?`Fastest: ${r.fastest.map(f=>`${f.hostname} ${Math.round(f.latency_ms)} ms`).join(' · ')}`:'No server answered ping.';await refreshVpn(false);}
   catch(error){showToast(error.message,true);}finally{b.disabled=false;b.textContent='Measure latency';}});
 $('vpnListRefreshBtn').addEventListener('click',async event=>{const b=event.currentTarget;b.disabled=true;
   try{const r=await api('/api/action',{method:'POST',body:JSON.stringify({action:'vpn_refresh'})});if(r.ok===false)throw new Error(r.error);showToast(r.message);await refreshVpn(false);}
   catch(error){showToast(error.message,true);}finally{b.disabled=false;}});
+$('vpnAutoSave').addEventListener('click',event=>{
+  vpnRun({action:'vpn_autopick',enabled:$('vpnAutoEnabled').checked,hours:Number($('vpnAutoHours').value)},'Change how the VPN server is chosen.',event.currentTarget);});
 $('vpnRotationSave').addEventListener('click',event=>{const countries=[...$('vpnRotationCountries').querySelectorAll('input:checked')].map(i=>i.value);
   vpnRun({action:'vpn_rotation',enabled:$('vpnRotationEnabled').checked,hours:Number($('vpnRotationHours').value),countries},'Change the automatic VPN rotation.',event.currentTarget);});
 $('vpnImportFile').addEventListener('change',async event=>{const file=event.target.files[0];event.target.value='';if(!file)return;
