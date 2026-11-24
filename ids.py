@@ -24,6 +24,28 @@ import sbc_site  # noqa: E402
 SITE = sbc_site.load()
 EVE = Path('/var/log/suricata/eve.json')
 DROPIN = Path('/etc/systemd/system/suricata.service.d/50-sbc-ids.conf')
+EVE_ALERTS = Path('/etc/suricata/sbc-eve-alerts.yaml')
+# Suricata's outputs, alerts only (an --include replaces the stock outputs list). The stock config also
+# logs every flow, DNS lookup, QUIC/TLS name, HTTP request and stats line: 99% of eve.json, read by
+# nothing here, and the household's browsing history. On Armbian /var/log is a 50 MB RAM disk: that
+# filled it in about a day, every other log there failed to write, and Armbian's truncate job copied
+# the whole disk to the flash every 15 minutes trying to make room.
+EVE_ALERTS_TEXT = """%YAML 1.1
+---
+# SBC Control Center (ids.py): alerts only. See ids.py for why.
+outputs:
+  - fast:
+      enabled: yes
+      filename: fast.log
+      append: yes
+  - eve-log:
+      enabled: yes
+      filetype: regular
+      filename: eve.json
+      types:
+        - alert:
+            tagged-packets: yes
+"""
 RULES_UNIT = f'{sbc_site.PREFIX}-ids-rules'
 TAIL_BYTES = 4 * 1024 * 1024
 _rules_cache: dict[str, Any] = {'mtime': None, 'enabled': 0}
@@ -36,7 +58,7 @@ def dropin_text(cfg: dict[str, str] | None = None) -> str:
     return f"""# SBC Control Center: watch the access points (IDS only, nothing is blocked)
 [Service]
 ExecStart=
-ExecStart=/usr/bin/suricata -D -c /etc/suricata/suricata.yaml --pidfile /run/suricata.pid {ifaces} --set vars.address-groups.HOME_NET=[{home}] --set detect.profile=low --set detect.sgh-mpm-context=single --set mpm-algo=ac-bs
+ExecStart=/usr/bin/suricata -D -c /etc/suricata/suricata.yaml --include {EVE_ALERTS} --pidfile /run/suricata.pid {ifaces} --set vars.address-groups.HOME_NET=[{home}] --set detect.profile=low --set detect.sgh-mpm-context=single --set mpm-algo=ac-bs
 # low-memory matching: the full ET Open set otherwise needs more than 1 GB on a small board
 MemoryHigh=1200M
 MemoryMax=1600M
@@ -76,6 +98,12 @@ WantedBy=timers.target
 def install_units() -> None:
     if os.geteuid() != 0:
         raise SystemExit('run as root')
+    EVE_ALERTS.write_text(EVE_ALERTS_TEXT)
+    # the merged config must parse before Suricata is pointed at it
+    check = subprocess.run(['/usr/bin/suricata', '-c', '/etc/suricata/suricata.yaml', '--include', str(EVE_ALERTS), '--dump-config'],
+                           capture_output=True, text=True, timeout=120)
+    if check.returncode != 0 or 'outputs.1.eve-log.types.0 = alert' not in check.stdout:
+        raise SystemExit(f'suricata does not accept {EVE_ALERTS}: {(check.stderr or check.stdout).strip()[-300:]}')
     DROPIN.parent.mkdir(parents=True, exist_ok=True)
     DROPIN.write_text(dropin_text())
     service, timer = rules_units()

@@ -16,6 +16,13 @@ class IdsTests(unittest.TestCase):
         self.assertIn('HOME_NET=[192.168.50.0/24,192.168.60.0/24]', text)
         self.assertIn('ExecStart=\nExecStart=/usr/bin/suricata', text)   # replaces Debian's eth0 default
 
+    def test_suricata_logs_alerts_only(self):
+        # the stock outputs log every flow and DNS lookup: they filled /var/log (a RAM disk) in a day
+        self.assertIn(f'--include {ids.EVE_ALERTS}', ids.dropin_text())
+        types = ids.EVE_ALERTS_TEXT.split('types:', 1)[1]
+        self.assertEqual([l.strip() for l in types.splitlines() if l.strip().startswith('- ')], ['- alert:'])
+        self.assertIn('filename: eve.json', ids.EVE_ALERTS_TEXT)   # where alerts_from_eve reads them
+
     def test_alerts_from_eve(self):
         now = time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime())
         old = time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(time.time() - 3 * 86400))
