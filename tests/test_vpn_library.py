@@ -295,6 +295,17 @@ class AlwaysFastestTests(unittest.TestCase):
         vl.autopick_tick()
         self.assertEqual(self.switched, [('za-jnb-wg-002', 'auto: faster')])
 
+    def test_hometubes_tunnel_stays_put_for_a_youtube_account_pinned_to_it(self):
+        self.second = 'us-hou-wg-001'                              # 270 ms: far slower than the free ones
+        self.main = 'za-jnb-wg-002'
+        self.ht['status'] = {'youtube_refused_at': None, 'lookup_ok_at': None, 'account': {'connected': True, 'via': 'tunnel'}}
+        vl.autopick_tick()                                         # due, but the account is pinned there
+        self.assertEqual(self.seconds, [])
+        self.ht['status']['account']['via'] = 'home'               # the account goes out at home: speed counts again
+        state = vl._state(); state['autopick_at'] = 0; vl._write_json(vl.STATE_PATH, state)
+        vl.autopick_tick()
+        self.assertEqual(self.seconds, ['za-jnb-wg-001'])
+
     def test_the_two_tunnels_never_share_a_server(self):
         self.main = self.second = 'za-jnb-wg-001'
         vl.autopick_tick()

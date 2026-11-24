@@ -870,10 +870,14 @@ def autopick_tick() -> dict[str, Any] | None:
         _begin_job('auto')
     except VpnError:
         return None   # a manual switch is running; look again next minute
-    return _job_body(_autopick, main_dead, second_dead, refused, second_on)
+    # a YouTube account HomeTube sends through its tunnel is pinned to that tunnel's server (HomeTube pauses
+    # it on any other): no moves for speed there, only when the server stops answering or YouTube refuses it
+    acct = (ht or {}).get('account') or {}
+    pinned = bool(acct.get('connected') and acct.get('via') == 'tunnel')
+    return _job_body(_autopick, main_dead, second_dead, refused, second_on, pinned)
 
 
-def _autopick(main_dead: bool, second_dead: bool, refused: bool, second_on: bool) -> dict[str, Any]:
+def _autopick(main_dead: bool, second_dead: bool, refused: bool, second_on: bool, pinned: bool = False) -> dict[str, Any]:
     why = ('the tunnel stopped answering' if main_dead else 'HomeTube\'s tunnel stopped answering' if second_dead
            else 'YouTube refuses lookups through HomeTube\'s tunnel' if refused else 'scheduled check')
     _log(f'Always the fastest server: {why}')
@@ -912,7 +916,7 @@ def _autopick(main_dead: bool, second_dead: bool, refused: bool, second_on: bool
             _log(f'YouTube refuses {second_host}: left alone for a day', 'warn')
             _leave_alone('youtube_avoid', second_host, YOUTUBE_AVOID)
         ranked2 = _ranked({main_host} if main_host else set(), youtube=True)
-        if second_dead or refused or second_host == main_host or _worth_moving(lat.get(second_host), ranked2):
+        if second_dead or refused or second_host == main_host or (not pinned and _worth_moving(lat.get(second_host), ranked2)):
             moved = False
             for ms, host in ranked2[:4]:
                 if host == second_host and not (second_dead or refused):
