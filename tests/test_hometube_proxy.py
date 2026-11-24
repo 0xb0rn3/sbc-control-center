@@ -13,12 +13,14 @@ PAGE_CSP = "default-src 'self'; script-src 'self'"
 
 class FakeHomeTube(BaseHTTPRequestHandler):
     seen = []
+    agents = []
 
     def log_message(self, *a):
         pass
 
     def do_GET(self):
         FakeHomeTube.seen.append(self.path)
+        FakeHomeTube.agents.append(self.headers.get('User-Agent'))
         body = b'<title>HomeTube</title>' if self.path == '/tv' else b'\x47' * 188 * 4
         self.send_response(200)
         self.send_header('Content-Type', 'text/html; charset=utf-8' if self.path == '/tv' else 'application/octet-stream')
@@ -32,6 +34,7 @@ class FakeHomeTube(BaseHTTPRequestHandler):
 class HomeTubeProxyTests(unittest.TestCase):
     def setUp(self):
         FakeHomeTube.seen = []
+        FakeHomeTube.agents = []
         web._tube_hits.clear()
         self.ht = ThreadingHTTPServer(('127.0.0.1', 0), FakeHomeTube)
         threading.Thread(target=self.ht.serve_forever, daemon=True).start()
@@ -47,9 +50,9 @@ class HomeTubeProxyTests(unittest.TestCase):
             s.shutdown()
             s.server_close()
 
-    def get(self, path):
+    def get(self, path, ua=None):
         # the portal answers only to its own address and port (a DNS-rebinding guard)
-        req = urllib.request.Request(self.base + path, headers={'Host': f'127.0.0.1:{web.PORT}'})
+        req = urllib.request.Request(self.base + path, headers={'Host': f'127.0.0.1:{web.PORT}', **({'User-Agent': ua} if ua else {})})
         return urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=10)
 
     def test_page_comes_with_hometubes_own_policy_only(self):
@@ -57,6 +60,12 @@ class HomeTubeProxyTests(unittest.TestCase):
         self.assertEqual(r.read(), b'<title>HomeTube</title>')
         self.assertEqual(r.headers.get_all('Content-Security-Policy'), [PAGE_CSP])   # one policy: two would combine and block the page
         self.assertEqual(FakeHomeTube.seen, ['/tv'])
+
+    def test_the_browser_name_reaches_hometube_and_nothing_odd_does(self):
+        self.get('/tv', ua='Mozilla/5.0 (Linux; VIDAA 9.6) Hisense').read()
+        self.get('/tv', ua='Mozilla/5.0 \u00e9t\u00e9').read()   # not plain ASCII: not passed on
+        self.assertEqual(FakeHomeTube.agents[0], 'Mozilla/5.0 (Linux; VIDAA 9.6) Hisense')
+        self.assertTrue(FakeHomeTube.agents[1].startswith('Python-urllib'))
 
     def test_stream_and_files_pass_through(self):
         self.assertEqual(self.get('/api/tv/hls?u=abc&s=def').read(), b'\x47' * 188 * 4)

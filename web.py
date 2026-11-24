@@ -688,6 +688,9 @@ class Handler(BaseHTTPRequestHandler):
         rng = self.headers.get('Range', '')
         if re.fullmatch(r'bytes=\d{0,15}-\d{0,15}', rng):
             headers['Range'] = rng
+        ua = str(self.headers.get('User-Agent') or '')[:240]
+        if ua and all(32 <= ord(c) < 127 for c in ua):   # the board-only HomeTube status lists the browsers that load /tv
+            headers['User-Agent'] = ua
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         try:
             resp = opener.open(urllib.request.Request(HOMETUBE_URL + path, headers=headers), timeout=40)
