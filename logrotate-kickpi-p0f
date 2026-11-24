@@ -1,0 +1,11 @@
+/var/log/kickpi-p0f/*.log {
+    daily
+    maxsize 1M
+    rotate 3
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su kickpi-p0f kickpi-p0f
+}

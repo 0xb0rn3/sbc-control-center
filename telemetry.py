@@ -20,6 +20,7 @@ PROC_PRESSURE = Path('/proc/pressure')
 DEVICE_TREE_MODEL = Path('/proc/device-tree/model')
 
 _previous_cpu: dict[str, tuple[int, int]] = {}
+_previous_cpu_sample_at: float | None = None
 _previous_net: dict[str, tuple[float, dict[str, int]]] = {}
 _previous_disk: tuple[float, dict[str, tuple[int, int]]] | None = None
 
@@ -44,8 +45,10 @@ def _read_cpu_times() -> dict[str, tuple[int, int]]:
     return values
 
 
-def _cpu_usage() -> dict[str, Any]:
-    global _previous_cpu
+def _cpu_usage(now: float | None = None) -> dict[str, Any]:
+    global _previous_cpu, _previous_cpu_sample_at
+    now = time.monotonic() if now is None else now
+    elapsed = max(0.0, now - _previous_cpu_sample_at) if _previous_cpu_sample_at is not None else None
     current = _read_cpu_times()
     result: dict[str, float | None] = {}
     for name, (total, idle) in current.items():
@@ -57,7 +60,12 @@ def _cpu_usage() -> dict[str, Any]:
         idle_delta = idle - previous[1]
         result[name] = round(max(0.0, min(100.0, 100.0 * (total_delta - idle_delta) / total_delta)), 1) if total_delta > 0 else 0.0
     _previous_cpu = current
-    return {'percent': result.get('cpu'), 'cores': [{'core': name, 'percent': value} for name, value in result.items() if name != 'cpu']}
+    _previous_cpu_sample_at = now
+    return {
+        'percent': result.get('cpu'),
+        'cores': [{'core': name, 'percent': value} for name, value in result.items() if name != 'cpu'],
+        'sample_interval_seconds': round(elapsed, 6) if elapsed is not None else None,
+    }
 
 
 def _read_int(path: Path) -> int:
@@ -145,7 +153,10 @@ def _network_rates(now: float) -> dict[str, Any]:
         previous = _previous_net.get(name)
         elapsed = max(0.001, now - previous[0]) if previous else 0.0
         old = previous[1] if previous else {}
-        row: dict[str, Any] = {'name': name, 'state': 'up' if counts.pop('_state_up') else 'down'}
+        row: dict[str, Any] = {
+            'name': name, 'state': 'up' if counts.pop('_state_up') else 'down',
+            'sample_interval_seconds': round(elapsed, 6) if previous else None,
+        }
         include = bool(counts.pop('_include_total'))
         for field, rate_name in (
             ('rx_bytes', 'rx_bytes_per_sec'), ('tx_bytes', 'tx_bytes_per_sec'),
@@ -187,13 +198,20 @@ def _disk_io(now: float) -> dict[str, Any]:
     except (OSError, ValueError):
         pass
     read_rate = write_rate = 0.0
+    elapsed_value = None
     if _previous_disk:
         elapsed = max(0.001, now - _previous_disk[0])
+        elapsed_value = elapsed
         old = _previous_disk[1]
         read_rate = sum(max(0, v[0] - old.get(k, v)[0]) for k, v in current.items()) / elapsed
         write_rate = sum(max(0, v[1] - old.get(k, v)[1]) for k, v in current.items()) / elapsed
     _previous_disk = (now, current)
-    return {'read_bytes_per_sec': round(read_rate, 1), 'write_bytes_per_sec': round(write_rate, 1), 'devices': len(current)}
+    return {
+        'read_bytes_per_sec': round(read_rate, 1),
+        'write_bytes_per_sec': round(write_rate, 1),
+        'devices': len(current),
+        'sample_interval_seconds': round(elapsed_value, 6) if elapsed_value is not None else None,
+    }
 
 
 def _memory() -> dict[str, int]:
@@ -323,8 +341,10 @@ def _process_count() -> int | None:
 def snapshot() -> dict[str, Any]:
     """Return a single sample. Call repeatedly (1–2s) to calculate rates."""
     now = time.monotonic()
-    cpu = _cpu_usage()
+    timestamp_ns = time.time_ns()
+    cpu = _cpu_usage(now)
     network = _network_rates(now)
+    disk_io = _disk_io(now)
     temperatures = _temperature_sensors()
     load: list[float] = []
     try:
@@ -337,17 +357,21 @@ def snapshot() -> dict[str, Any]:
     except (OSError, ValueError, IndexError):
         uptime = None
     return {
-        'timestamp': time.time(), 'uptime_seconds': round(uptime, 1) if uptime is not None else None,
+        'timestamp': timestamp_ns / 1_000_000_000,
+        'timestamp_ns': timestamp_ns,
+        'monotonic_ns': time.monotonic_ns(),
+        'uptime_seconds': round(uptime, 1) if uptime is not None else None,
         'device_model': _device_model(), 'process_count': _process_count(),
         'cpu': cpu, 'cpu_frequency': _cpu_frequency(), 'accelerators': _accelerator_metrics(),
         'memory': _memory(), 'pressure': _pressure(),
         'temperature_c': temp, 'temperatures': temperatures,
-        'network': network, 'disk_io': _disk_io(now), 'load': load,
+        'network': network, 'disk_io': disk_io, 'load': load,
     }
 
 
 def reset_for_tests() -> None:
-    global _previous_cpu, _previous_net, _previous_disk
+    global _previous_cpu, _previous_cpu_sample_at, _previous_net, _previous_disk
     _previous_cpu = {}
+    _previous_cpu_sample_at = None
     _previous_net = {}
     _previous_disk = None

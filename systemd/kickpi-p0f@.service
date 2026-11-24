@@ -1,0 +1,44 @@
+[Unit]
+Description=KickPi passive TCP/IP fingerprint monitor on %i
+Documentation=https://github.com/p0f/p0f
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/sys/class/net/%i
+ConditionPathExists=/etc/p0f/p0f.fp
+
+[Service]
+Type=simple
+User=kickpi-p0f
+Group=kickpi-p0f
+LogsDirectory=kickpi-p0f
+LogsDirectoryMode=0750
+# p0f 3 has no quiet option: its per-connection lines go to stdout, which is dropped (the log file has
+# them; the journal is in RAM on small boards). Its errors still reach the journal.
+ExecStart=/usr/sbin/p0f -i %i -f /etc/p0f/p0f.fp -o /var/log/kickpi-p0f/%i.log -m 500,2000
+StandardOutput=null
+StandardError=journal
+Restart=on-failure
+RestartSec=3
+UMask=0027
+Nice=10
+CPUWeight=10
+CPUQuota=10%
+MemoryMax=48M
+TasksMax=16
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=CAP_NET_RAW
+AmbientCapabilities=CAP_NET_RAW
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
+SystemCallArchitectures=native
+ReadWritePaths=/var/log/kickpi-p0f
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,37 @@
+/* Living-room view: wallpaper, greeting, big clock, rotating quote (after the ArxOS lock screen). */
+.lr { position: fixed; inset: 0; z-index: 5; pointer-events: none; color: #fff;
+  font-family: Inter, "Hanken Grotesk", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  text-shadow: 0 2px 18px rgba(0,0,0,.55), 0 1px 2px rgba(0,0,0,.6); }
+.lr::before { content: ''; position: absolute; inset: 0;
+  background: radial-gradient(60% 45% at 50% 8%, rgba(232,112,42,.12), transparent 60%),
+              radial-gradient(70% 55% at 50% 120%, rgba(232,112,42,.10), transparent 66%),
+              radial-gradient(ellipse 55% 45% at 50% 46%, rgba(0,0,0,.42), rgba(0,0,0,.16) 55%, transparent 80%),
+              radial-gradient(ellipse 70% 40% at 50% 100%, rgba(0,0,0,.45), transparent 70%); }
+.lr-greet { margin-bottom: clamp(4px, 1vh, 12px); font-size: clamp(22px, 2.4vw, 42px); font-weight: 400; letter-spacing: .01em; opacity: .95; }
+/* the clock sits in the middle of the screen; the quote below it, centred */
+.lr-clock { position: absolute; left: 50%; top: 46%; transform: translate(-50%, -50%); text-align: center; white-space: nowrap; }
+.lr-time { font-size: clamp(64px, 11vw, 190px); font-weight: 250; letter-spacing: -.025em; line-height: .95; font-variant-numeric: tabular-nums; }
+.lr-date { margin-top: 12px; font-size: clamp(15px, 1.6vw, 26px); opacity: .92; }
+.lr-label { margin-top: 6px; font-size: clamp(11px, .95vw, 15px); opacity: .65; letter-spacing: .04em; }
+.lr-quote { position: absolute; left: 50%; bottom: clamp(26px, 7vh, 84px); transform: translateX(-50%); width: min(76vw, 980px); margin: 0;
+  text-align: center; transition: opacity 1.2s ease; }
+.lr-quote.fade { opacity: 0; }
+.lr-orig { margin: 0 0 8px; font-family: "SBC World", "Noto Sans", sans-serif;
+  font-size: clamp(19px, 2.1vw, 36px); line-height: 1.35; font-weight: 450; unicode-bidi: plaintext; }
+.lr-orig[dir="rtl"] { font-size: clamp(21px, 2.3vw, 40px); }
+.lr-quote blockquote.translation { font-size: clamp(13px, 1.25vw, 21px); opacity: .88; }
+.lr-quote blockquote { margin: 0; font-size: clamp(15px, 1.55vw, 27px); line-height: 1.38; font-weight: 400; font-style: italic; }
+.lr-quote figcaption { margin-top: 10px; font-size: clamp(11px, .95vw, 15px); opacity: .72; letter-spacing: .03em; }
+@media (max-width: 760px) {
+  .lr-clock { top: 40%; }
+  .lr-quote { width: calc(100vw - 40px); bottom: clamp(20px, 5vh, 48px); }
+}
+/* slideshow pictures: filling the screen, or (when the shape does not fit) whole over a blurred copy */
+.sbc-slide.fit .sbc-blur, .sbc-slide.fit .sbc-fg { position: absolute; inset: 0; background-repeat: no-repeat; }
+.sbc-slide.fit { overflow: hidden; }
+.sbc-slide.fit .sbc-fg { background-size: cover; background-position: center 34%; }
+.sbc-slide.fit .sbc-blur { display: none; background-size: cover; background-position: center; filter: blur(38px) brightness(.5) saturate(1.15); transform: scale(1.2); }
+.sbc-slide.fit.contain .sbc-blur { display: block; }
+.sbc-slide.fit.contain .sbc-fg { background-size: contain; background-position: center; }
+.lr-pictures { position: fixed; inset: 0; z-index: 4; background: #08090c; }
+@media (prefers-reduced-motion: reduce) { .lr-quote { transition: none; } }

@@ -1,0 +1,3 @@
+__pycache__/
+assets/wallpapers/*
+!assets/wallpapers/README.txt

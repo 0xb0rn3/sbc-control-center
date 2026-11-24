@@ -60,7 +60,11 @@ if [[ -r /etc/os-release ]]; then
 fi
 
 SRC="${SBC_CONTROL_CENTER_SOURCE:-$(cd "$(dirname "$0")" && pwd)}"
-if [[ ! -f "$SRC/agent.py" || ! -f "$SRC/web.py" || ! -f "$SRC/telemetry.py" || ! -f "$SRC/realtime_telemetry.py" || ! -f "$SRC/network_observability.py" || ! -f "$SRC/packet_monitor.py" || ! -f "$SRC/packet_analysis.py" || ! -f "$SRC/device_intelligence.py" || ! -f "$SRC/network_discovery.py" || ! -f "$SRC/wireless_adapter.py" || ! -f "$SRC/dns_filter.py" || ! -f "$SRC/dns_bypass_sensor.py" || ! -f "$SRC/pam_auth.py" || ! -f "$SRC/index.html" || ! -f "$SRC/assets/ui-background.png" ]]; then
+missing=()
+for f in agent.py web.py sbc_site.py index.html standby.html assets/ui-background.png assets/ui/slideshow.js assets/vendor/xterm.js; do
+  [[ -f "$SRC/$f" ]] || missing+=("$f")
+done
+if (( ${#missing[@]} )); then
   echo "SBC Control Center source files were not found in: $SRC" >&2
   exit 1
 fi
@@ -74,9 +78,8 @@ if len(data) > 4_000_000 or data[:8] != b'\x89PNG\r\n\x1a\n':
 print(f'Portal background asset: {len(data):,} bytes')
 PY
 
-printf '\n[1/7] Installing required packages...\n'
-apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-fido2 openssl iw nftables iproute2 procps util-linux wireguard-tools curl sudo libpam0g arp-scan nmap tshark p0f arpwatch avahi-utils ieee-data
+printf '\n[1/7] Installing required packages (packages/debian-required.txt, AdGuard Home, DB-IP)...\n'
+bash "$SRC/tools/install-dependencies.sh" ${SBC_WITH_OPTIONAL:+--all}
 
 printf '\n[2/7] Creating restricted portal account...\n'
 getent group "$GROUP" >/dev/null || groupadd --system "$GROUP"
@@ -86,19 +89,15 @@ fi
 
 install -d -o root -g "$GROUP" -m 0750 "$APP_DIR" "$ETC_DIR" "$STATE_DIR"
 install -d -o "$USER" -g "$GROUP" -m 0700 /var/lib/sbc-control-center-web
-install -o root -g root -m 0755 "$SRC/agent.py" "$APP_DIR/agent.py"
-install -o root -g root -m 0644 "$SRC/telemetry.py" "$APP_DIR/telemetry.py"
-for module in realtime_telemetry network_observability packet_monitor packet_analysis device_intelligence network_discovery wireless_adapter dns_filter dns_bypass_sensor; do
-  install -o root -g root -m 0644 "$SRC/$module.py" "$APP_DIR/$module.py"
+# every application file: Python modules, the page, the TV page, assets (wallpapers stay yours)
+(cd "$SRC" && find . -type f \( -name '*.py' -o -name '*.html' -o -path './assets/*' -o -name VERSION \) \
+   ! -path './tests/*' ! -path './tools/*' ! -path './.git/*' ! -path './assets/wallpapers/*' -print0) |
+while IFS= read -r -d '' f; do
+  f=${f#./}; mode=0644
+  case "$f" in agent.py|web.py|set_password.py|configure_mfa.py|sbc_admin.py) mode=0755;; esac
+  install -D -o root -g root -m "$mode" "$SRC/$f" "$APP_DIR/$f"
 done
-install -o root -g root -m 0644 "$SRC/pam_auth.py" "$APP_DIR/pam_auth.py"
-install -o root -g root -m 0755 "$SRC/web.py" "$APP_DIR/web.py"
-install -o root -g root -m 0644 "$SRC/index.html" "$APP_DIR/index.html"
-install -d -o root -g root -m 0755 "$APP_DIR/assets"
-install -o root -g root -m 0644 "$SRC/assets/ui-background.png" "$APP_DIR/assets/ui-background.png"
-if [[ -f "$SRC/VERSION" ]]; then install -o root -g root -m 0644 "$SRC/VERSION" "$APP_DIR/VERSION"; fi
-install -o root -g root -m 0755 "$SRC/set_password.py" "$APP_DIR/set_password.py"
-install -o root -g root -m 0755 "$SRC/configure_mfa.py" "$APP_DIR/configure_mfa.py"
+install -d -o root -g root -m 0755 "$APP_DIR/assets/wallpapers"
 
 python3 - "$ETC_DIR/config.json" "$AP_IFACE" "$AP_SSID" "$AP_IP" "$AP_SUBNET" "$VPN_INTERFACE" "$VPN_UNIT" "$AP2_IFACE" "$AP2_SSID" "$AP2_IP" "$AP2_SUBNET" <<'PY'
 import json, os, sys, tempfile
@@ -281,6 +280,29 @@ python3 "$APP_DIR/set_password.py"
 printf '\n[7/7] Starting Control Center...\n'
 systemctl daemon-reload
 systemctl enable --now sbc-control-center-agent.service sbc-control-center-web.service
+# monthly IEEE vendor registry refresh (the unit is written by the program it runs)
+python3 "$APP_DIR/sbc_admin.py" oui install-units
+
+# HomeTube (github.com/0xb0rn3/hometube): YouTube for the TV, served by this board at /tv. Optional.
+#   INSTALL_HOMETUBE=yes|no answers the question in advance.
+INSTALL_HOMETUBE="${INSTALL_HOMETUBE:-}"
+if [[ -z "$INSTALL_HOMETUBE" && -t 0 ]]; then
+  read -r -p "Install HomeTube (YouTube for your TV, served by this board at /tv)? [y/N] " answer
+  [[ "${answer,,}" == "y" ]] && INSTALL_HOMETUBE=yes || INSTALL_HOMETUBE=no
+fi
+if [[ "${INSTALL_HOMETUBE,,}" == "yes" ]]; then
+  printf '\n[+] HomeTube...\n'
+  HT_SRC=$(mktemp -d)
+  curl -fsSL --retry 3 https://github.com/0xb0rn3/hometube/archive/refs/heads/main.tar.gz | tar -xz -C "$HT_SRC" --strip-components=1
+  HT_ARGS=(--bind 127.0.0.1 --port 8891)
+  # HomeTube's own traffic through the VPN tunnel when its table (200) is in place; it then checks
+  # before every request to YouTube that it leaves by the tunnel, and refuses otherwise
+  if ip -4 route show table 200 2>/dev/null | grep -q "dev $VPN_INTERFACE"; then
+    HT_ARGS+=(--route-table 200 --route-dev "$VPN_INTERFACE" --after "$VPN_UNIT.service")
+  fi
+  bash "$HT_SRC/install.sh" "${HT_ARGS[@]}"
+  rm -rf "$HT_SRC"
+fi
 
 AP_ADDR="$AP_IP"
 ETH_ADDR="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}' || true)"
