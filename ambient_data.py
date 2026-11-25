@@ -256,9 +256,15 @@ def _snapshot() -> dict[str, Any]:
     if isinstance(location.get("latitude"),(float,int)) and isinstance(location.get("longitude"),(float,int)):
         local_weather = [{"name":location.get("label","Your area"),"country":"",
                           "lat":location["latitude"],"lon":location["longitude"]}]
-    city_weather = _weather(CITIES)
+    # One multi-coordinate Open-Meteo call covers the estimated local area
+    # (when known) plus every regional city, keeping the standby refresh quick.
+    weather_locations = local_weather + CITIES
+    weather_rows = _weather(weather_locations)
     if local_weather:
-        local_weather = _weather(local_weather)
+        local_weather = weather_rows[:1]
+        city_weather = weather_rows[1:]
+    else:
+        city_weather = weather_rows
 
     fx_future = _fetch_pool.submit(_fx)
     news_future = _fetch_pool.submit(_news)
