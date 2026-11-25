@@ -23,7 +23,7 @@ class ZltRouterConfigTests(unittest.TestCase):
         with mock.patch.object(zlt_readonly, "CONFIG_PATH", fake):
             config = zlt_readonly._config()
         self.assertEqual(config["host"], "192.168.1.1")
-        self.assertNotIn("password", config)
+        self.assertEqual(config["password"], "not-a-real-password")
 
     def test_public_router_host_is_rejected(self):
         fake = self._fake_path({
