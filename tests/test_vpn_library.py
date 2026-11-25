@@ -68,7 +68,11 @@ class VpnLibraryTests(unittest.TestCase):
 
     def test_endpoint_and_key_validation(self):
         self.assertEqual(vl._valid_endpoint('8.8.4.4:51820'), ('8.8.4.4', 51820))
-        for bad in ('10.0.0.1:51820', '8.8.4.4:0', 'example.com:51820', '8.8.4.4', '127.0.0.1:1'):
+        # A domain endpoint is looked up once; mock DNS to keep this assertion
+        # deterministic in CI and independent of the runner's live resolver.
+        with mock.patch.object(vl.socket, 'getaddrinfo', return_value=[]):
+            self.assertIsNone(vl._valid_endpoint('example.com:51820'))
+        for bad in ('10.0.0.1:51820', '8.8.4.4:0', '8.8.4.4', '127.0.0.1:1'):
             self.assertIsNone(vl._valid_endpoint(bad), bad)
         self.assertTrue(vl._KEY.fullmatch(KEY_A))
         self.assertFalse(vl._KEY.fullmatch('short='))
