@@ -24,6 +24,18 @@ class CellIdentityTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             location.observation_from_router({"MCC": "640", "MNC": "05", "CELL_ID": "XYZ"})
 
+    def test_numeric_only_router_cell_id_is_still_hex(self):
+        observation = location.observation_from_router({
+            "MCC": "640", "MNC": "05", "CELL_ID": "123456"
+        })
+        self.assertEqual(observation["cell"], str(int("123456", 16)))
+
+    def test_tac_is_included_when_router_reports_it(self):
+        observation = location.observation_from_router({
+            "ECGI": "6400503CE233", "TAC": "0xC123"
+        })
+        self.assertEqual(observation["area"], str(int("C123", 16)))
+
 
 class CellLookupTests(unittest.TestCase):
     def setUp(self):
