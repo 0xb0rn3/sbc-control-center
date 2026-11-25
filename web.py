@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 import sbc_site
+import ambient_data
 
 try:
     from threat_intelligence import snapshot as security_operations_snapshot, get_event_evidence as security_event_evidence
@@ -1163,6 +1164,19 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(429, {'ok': False, 'error': 'Too many requests; wait a minute.'})
                 return
             self.relay_hometube(path + ('?' + parsed.query if parsed.query else ''))
+            return
+        if path == '/api/ambient':
+            # The living-room screen is intentionally sign-in-free. This bounded
+            # endpoint returns only approximate location and public ambient feeds;
+            # it never returns the router WAN IP, cell identifiers or credentials.
+            if not tube_allowed('ambient:' + client_ip(self), limit=12, window=60):
+                self.send_json(429, {'ok': False, 'error': 'Ambient refresh rate exceeded; retry shortly.'})
+                return
+            try:
+                self.send_json(200, ambient_data.snapshot())
+            except Exception as exc:
+                print(f'[AMBIENT] snapshot-error type={type(exc).__name__}', flush=True)
+                self.send_json(503, {'ok': False, 'error': 'Ambient data is temporarily unavailable.'})
             return
         if path in ('/standby', '/living-room'):
             try:
