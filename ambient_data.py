@@ -6,6 +6,7 @@ import datetime as dt
 import email.utils
 import ipaddress
 import json
+import math
 import threading
 import time
 import urllib.parse
@@ -195,6 +196,21 @@ def _news() -> list[dict[str, Any]]:
     return rows[:10]
 
 
+def _nearest_city(latitude: float, longitude: float) -> dict[str, Any] | None:
+    """Name a nearby known city only when it is genuinely close to the estimate."""
+    closest = None
+    closest_km = 1e9
+    for city in CITIES:
+        lat1, lat2 = math.radians(latitude), math.radians(city["lat"])
+        dlat = lat2 - lat1
+        dlon = math.radians(city["lon"] - longitude)
+        hav = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+        distance = 6371.0 * 2 * math.asin(min(1.0, math.sqrt(hav)))
+        if distance < closest_km:
+            closest, closest_km = city, distance
+    return closest if closest is not None and closest_km <= 65 else None
+
+
 def _router_location() -> tuple[dict[str, Any], str | None]:
     try:
         radio = zlt_readonly.network_info()
@@ -205,10 +221,13 @@ def _router_location() -> tuple[dict[str, Any], str | None]:
     result = ambient_location.resolve_from_router(radio)
     if result.get("status") == "estimated" and result.get("location"):
         point = result["location"]
+        nearest = _nearest_city(float(point["latitude"]), float(point["longitude"]))
+        label = (f'Near {nearest["name"]}, {nearest["country"]} · cell-area estimate'
+                 if nearest else "Approximate cellular area")
         return ({
             "status":"estimated","source":"LTE cell tower",
             "message":"Serving-cell area estimate; not the router's exact position.",
-            "label":"Approximate cellular location","confidence":"cell",
+            "label":label,"confidence":"cell",
             "latitude":point["latitude"],"longitude":point["longitude"],
             "range_m":point.get("range_m"),
             "attribution":result.get("attribution",ambient_location.API_ATTRIBUTION),
