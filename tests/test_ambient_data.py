@@ -24,6 +24,11 @@ class AmbientReferenceDataTests(unittest.TestCase):
         sources = {name for name, _url in ambient_data.NEWS_FEEDS}
         self.assertEqual(sources, {"TechCrunch","The Verge","Ars Technica","BBC Technology"})
 
+    def test_cell_estimate_only_uses_nearby_city_names(self):
+        nearby = ambient_data._nearest_city(-2.52, 32.92)
+        self.assertEqual(nearby["name"], "Mwanza")
+        self.assertIsNone(ambient_data._nearest_city(-20.0, 20.0))
+
 
 if __name__ == "__main__":
     unittest.main()
