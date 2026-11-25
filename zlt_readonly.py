@@ -31,6 +31,7 @@ _CACHE_SECONDS = 45
 _cache_lock = threading.Lock()
 _cache: tuple[float, dict[str, Any]] | None = None
 _router_lock = threading.Lock()
+_session: dict[str, str] = {'host':'', 'username':'', 'credential_hash':'', 'session_id':''}
 
 
 class RouterUnavailable(RuntimeError):
@@ -96,40 +97,60 @@ def _rpc(host: str, command: str, session_id: str = "", method: str = "GET",
     return parsed
 
 
+def _login(host: str, username: str, password: str) -> str:
+    try:
+        try:
+            _rpc(host, CMD_PRELOGIN, timeout=2.0)
+        except Exception:
+            pass
+        token_result = _rpc(host, CMD_LOGIN_TOKEN)
+        token = token_result.get("token")
+        if not token_result.get("success") or not isinstance(token, str) or not token:
+            raise RouterUnavailable("The router did not issue a login token.")
+        session_id = secrets.token_hex(32)
+        login = _rpc(host, CMD_LOGIN, session_id, "POST", {
+            "username": username,
+            "passwd": hashlib.sha256((token + password).encode("utf-8")).hexdigest(),
+            "token": token,
+        })
+        if not login.get("success"):
+            message = str(login.get("message", ""))
+            if message == "alreadyLogin":
+                raise RouterUnavailable("The router admin account is already signed in elsewhere.")
+            raise RouterUnavailable("The router rejected the configured credentials.")
+        return str(login.get("sessionId") or session_id)
+    except RouterUnavailable:
+        raise
+    except Exception as exc:
+        raise RouterUnavailable(f"Router login could not be completed ({type(exc).__name__}).")
+
+
 def _read_network_info(cfg: dict[str, str]) -> dict[str, Any]:
     host, username, password = cfg["host"], cfg["username"], cfg["password"]
-    # The firmware allows one admin session per account; serialize login and read.
+    fingerprint = hashlib.sha256(password.encode("utf-8")).hexdigest()
+    # The firmware allows one admin session per account; serialize all reads
+    # and retain our session rather than logging in on every weather refresh.
     with _router_lock:
+        if (_session["host"] != host or _session["username"] != username
+                or _session["credential_hash"] != fingerprint or not _session["session_id"]):
+            _session.update({"host":host,"username":username,
+                             "credential_hash":fingerprint,
+                             "session_id":_login(host,username,password)})
         try:
-            try:
-                _rpc(host, CMD_PRELOGIN, timeout=2.0)
-            except Exception:
-                pass
-            token_result = _rpc(host, CMD_LOGIN_TOKEN)
-            token = token_result.get("token")
-            if not token_result.get("success") or not isinstance(token, str) or not token:
-                raise RouterUnavailable("The router did not issue a login token.")
-            session_id = secrets.token_hex(32)
-            login = _rpc(host, CMD_LOGIN, session_id, "POST", {
-                "username": username,
-                "passwd": hashlib.sha256((token + password).encode("utf-8")).hexdigest(),
-                "token": token,
-            })
-            if not login.get("success"):
-                message = str(login.get("message", ""))
-                if message == "alreadyLogin":
-                    raise RouterUnavailable("The router admin account is already signed in elsewhere.")
-                raise RouterUnavailable("The router rejected the configured credentials.")
-            session_id = str(login.get("sessionId") or session_id)
-            info = _rpc(host, CMD_NETINFO, session_id)
+            info = _rpc(host, CMD_NETINFO, _session["session_id"])
+            if not info.get("success"):
+                message = str(info.get("message", ""))
+                if message in ("NO_AUTH", "LOGIN_TIMEOUT"):
+                    _session["session_id"] = _login(host,username,password)
+                    info = _rpc(host, CMD_NETINFO, _session["session_id"])
             if not info.get("success"):
                 raise RouterUnavailable("The router did not return radio status.")
             # Return only fields needed for cell identity, signal display and
             # coarse fallback. Subscriber identifiers are deliberately omitted.
             allowed = (
-                "ECGI", "ecgi", "CELL_ID", "cell_id", "MCC", "MNC", "PCI",
-                "network_operator", "network_type_str", "currentband", "FREQ",
-                "RSRP", "RSRQ", "SINR", "RSSI", "wan_ip",
+                "ECGI", "ecgi", "CELL_ID", "cell_id", "MCC", "MNC", "TAC", "tac",
+                "CELL_AREA", "PCI", "network_operator", "network_type_str",
+                "currentband", "FREQ", "RSRP", "RSRQ", "SINR", "RSSI", "wan_ip",
             )
             safe = {key: info[key] for key in allowed if key in info}
             safe["router_host"] = host
@@ -137,6 +158,7 @@ def _read_network_info(cfg: dict[str, str]) -> dict[str, Any]:
         except RouterUnavailable:
             raise
         except Exception as exc:
+            _session["session_id"] = ""
             raise RouterUnavailable(f"Router status could not be read ({type(exc).__name__}).")
 
 
