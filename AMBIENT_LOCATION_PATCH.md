@@ -1,56 +1,36 @@
-# SBC Control Center — LTE cell-location helper patch
+# SBC Control Center — ambient dashboard and router location
 
-This patch adds a small, dependency-free helper for resolving a ZLT X17U LTE serving
-cell to a **best-effort cell-area estimate** using the MCC-MNC cell API (OpenCelliD data).
+The /living-room display now includes a moving analogue clock, East Africa digital date/time, city weather, world clocks, USD exchange rates and technology headlines. It preserves the wallpaper slideshow and quote feed.
 
-## What it does
+Router configuration: create `/etc/sbc-control-center/router.json` using `sudoedit`:
 
-- Accepts the X17U's `ECGI` or separate `MCC`, `MNC`, and `CELL_ID` fields.
-- Converts the supplied X17U ECGI `6400503CE233` into MCC `640`, MNC `05`, ECI `0x3CE233` / decimal `3990067`.
-- Looks up the full LTE ECI. It does not use PCI as a cell identifier.
-- Returns `estimated`, `ambiguous`, `not_found`, or `lookup_error`.
-- Does not select a location when multiple cells match and TAC is missing.
-- Caches results in process memory for six hours.
-- Does not use the SBC's public IP, VPN exit IP, IMEI, IMSI, ICCID, phone number, or router credentials.
-
-## Important integration boundary
-
-The helper expects the caller to obtain a **read-only router status snapshot** from the
-local ZLT X17U/W154R Plus interface and pass that mapping to `resolve_from_router()`.
-It does not log in to the router, alter radio/band settings, or guess undocumented CGI
-paths. The current repository needs a small follow-up adapter/route to connect this helper
-to its existing ambient dashboard UI. That adapter must run server-side on the K2B and
-must not expose router credentials or raw subscriber identifiers to browsers.
-
-Example:
-
-```python
-from ambient_location import resolve_from_router
-
-# `router_status` must be the read-only status response from the local X17U.
-location = resolve_from_router(router_status)
+```json
+{
+  "host": "192.168.1.1",
+  "username": "admin",
+  "password": "YOUR_ROUTER_ADMIN_PASSWORD"
+}
 ```
 
-A returned coordinate is the estimated serving-cell area, not the K2B's exact physical
-position. If there are multiple matches and no TAC, the result is `ambiguous`; do not
-silently choose the first point.
-
-## Attribution and network use
-
-The API endpoint is `https://mcc-mnc.org/api/v1/cells`. Its cell data is sourced from
-OpenCelliD and licensed CC BY-SA 4.0. Preserve the returned attribution when displaying
-coordinates. The API's anonymous allowance is limited; the six-hour in-process cache
-reduces repeated requests. Network access is required for the lookup.
-
-## Apply
-
-From the repository root:
+Then apply ownership and mode (adjust the group if the portal group has a custom name):
 
 ```bash
-git apply sbc-ambient-location.patch
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_ambient_location -v
+sudo chown root:sbc-control-center /etc/sbc-control-center/router.json
+sudo chmod 0640 /etc/sbc-control-center/router.json
+sudo systemctl restart sbc-control-center-web
 ```
 
-The patch adds the helper and unit tests only. It intentionally does not change the live
-portal routes or UI until the exact read-only ZLT status adapter and desired display surface
-are verified on the user's router.
+The K2B reads ZLT X17U network status only. It does not change router settings or expose credentials, WAN IP or subscriber IDs to the browser. Cell records are queried by MCC/MNC/ECI and TAC when available. A single result is shown as a serving-cell area estimate; ambiguous matches are never silently selected. When cell lookup has no unique coordinate, only the public WAN IP reported by the ZLT router may be used as a coarse fallback. Private/CGNAT addresses are skipped; the K2B's public/VPN exit IP is never geolocated.
+
+The page shows local weather when a coordinate is available, plus the 14 regional cities in all cases. Data sources: Open-Meteo weather (CC BY 4.0), ExchangeRate-API, publisher RSS feeds from TechCrunch, The Verge, Ars Technica and BBC Technology. Cell map attribution: OpenCelliD, CC BY-SA 4.0. All ambient data is server-side cached for three minutes; router status is cached for 45 seconds.
+
+`/api/ambient` is public on the trusted LAN because the standby screen is sign-in-free. It is rate-limited and returns display-safe data only. Keep HTTPS/8443 on the LAN and never forward it to the public internet.
+
+Run:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_ambient_location tests.test_ambient_data -v
+python3 -m py_compile ambient_location.py zlt_readonly.py ambient_data.py web.py
+```
+
+Protocol acknowledgement: the ZLT endpoint identifiers and token login flow were checked against [Mevhare/airtel-odu-app](https://github.com/Mevhare/airtel-odu-app), an MIT-licensed project. This repository implements a separate read-only adapter. See [upstream licence](https://github.com/Mevhare/airtel-odu-app/blob/master/LICENSE).
